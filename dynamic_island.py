@@ -17,7 +17,7 @@ Python 3.9+ / Windows 10 及以上。
 交互：
     位置固定，不能拖动
     右键        -> 设置菜单（主题、刷新频率、图片轮换、开机自启、全屏自动隐藏、
-                   下一张图片、回到顶部中央、退出）
+                   下一张图片、收起为图标、退出）
     右侧齿轮    -> 单击同样打开设置菜单（快捷入口）
 """
 
@@ -3023,7 +3023,7 @@ class SettingsPanel:
     DANGER_TEXT = "#FF8A8A"
     # 上面这些由 apply_theme() 按主题改写；面板逻辑尺寸放这里，预热位图时也用同一份
     W_LOG = 300
-    H_LOG = 542
+    H_LOG = 502
 
     def __init__(self, app):
         self.app = app
@@ -3115,13 +3115,12 @@ class SettingsPanel:
 
         # 动作按钮
         self._action(S(410), "收起为图标", "collapse")
-        self._action(S(452), "回到屏幕顶部中央", "recenter")
-        self._action(S(494), "退出灵动岛", "quit", danger=True)
+        self._action(S(452), "退出灵动岛", "quit", danger=True)
 
         with self.app.sampler.lock:
             up = self.app.sampler.data.get("uptime")
         if up:
-            c.create_text(w // 2, S(526), text=fmt_uptime(up), font=self.f_small, fill=MUTED)
+            c.create_text(w // 2, S(486), text=fmt_uptime(up), font=self.f_small, fill=MUTED)
 
     def _seg_row(self, y, items, current, kind):
         """一排等宽胶囊分段：既是主题选择也是刷新频率选择"""
@@ -3208,8 +3207,6 @@ class SettingsPanel:
         elif kind == "collapse":
             self.close()
             self.app._collapse()
-        elif kind == "recenter":
-            self.app._recenter()
         elif kind == "quit":
             self.quit_app()
 
@@ -3892,7 +3889,6 @@ class IslandApp:
 
         m.add_separator()
         m.add_command(label="收起为图标", command=self._collapse)
-        m.add_command(label="回到屏幕顶部中央", command=self._recenter)
         m.add_command(label="退出", command=self._quit)
         try:
             m.tk_popup(x_root, y_root)
@@ -3924,11 +3920,6 @@ class IslandApp:
 
     def _set_rate(self):
         self.set_rate_value(self._rate_var.get())
-
-    def _recenter(self):
-        self.anchor_cx = self.root.winfo_screenwidth() // 2
-        self.anchor_y = self.S(TOP_OFFSET)
-        self._apply_geometry()
 
     def _quit(self):
         if self._settings is not None:
