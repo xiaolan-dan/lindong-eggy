@@ -1036,32 +1036,16 @@ def make_photo_panel_image(master, w: int, h: int, src_w: int, src_h: int,
     return _photo_from_ppm(master, w, h, bytes(body)), bytes(body)
 
 
-def make_photo_frame_base(w: int, h: int, src_w: int, src_h: int, src_rows,
-                          scrim_top: float, scrim_bot: float):
-    """照片按 w×h 重采样并压暗一次（最近邻，够动画用），返回整幅 RGB 字节"""
-    if src_w * h > w * src_h:
-        cw, chh = src_h * w / float(h), float(src_h)
-        x0, y0 = (src_w - cw) / 2.0, 0.0
-    else:
-        cw, chh = float(src_w), src_w * h / float(w)
-        x0, y0 = 0.0, (src_h - chh) / 2.0
-    ktop, kbot = 1.0 - scrim_top, 1.0 - scrim_bot
-    xs = [min(src_w - 1, int(x0 + (x + 0.5) * cw / w)) for x in range(w)]
-    body = bytearray()
-    for y in range(h):
-        f = ktop + (kbot - ktop) * (y / float(max(1, h - 1)))
-        sy = min(src_h - 1, int(y0 + (y + 0.5) * chh / h))
-        rowoff = sy * src_w
-        for sx in xs:
-            i = (rowoff + sx) * 3
-            body += bytes((int(src_rows[i] * f),
-                           int(src_rows[i + 1] * f),
-                           int(src_rows[i + 2] * f)))
-    return bytes(body)
+def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows,
+                     margin: int = 3, keep_scale: bool = True):
+    """用预采样好的照片行 + 胶囊遮罩拼一帧：中间段整块拷贝，只有圆头要逐点算
 
+    base_rows 是 h0 高那种胶囊的**成品像素**，外圈 1~2px 是描边 / 抠色，
+    所以取行时只从 [margin, base_h-1-margin] 这一段里抽，避免把边缘色带进内部。
 
-def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows):
-    """用预采样好的照片行 + 胶囊遮罩拼一帧：中间段整块拷贝，只有圆头要逐点算"""
+    keep_scale=True 时 pixel 1:1（不拉伸照片，变高的那几行用边缘行外延补齐），
+    这样悬停展开时人脸不会纵向变长；False 则把整段拉伸铺满 h 行。
+    """
     key_rgb = _hex_rgb(KEY_COLOR)
     key_bytes = bytes(key_rgb)
     rim_rgb = _hex_rgb(BORDER)
@@ -1071,9 +1055,23 @@ def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     half = max(0.0, (x1 - x0) / 2.0 - r)
     sq = math.sqrt
+    lo = max(0, min(base_h - 1, margin))
+    hi = max(lo + 1, base_h - margin)
+    span = float(hi - lo)
+    if keep_scale:
+        top, bot = lo, hi                             # 真正用来 1:1 显示的行区间
+        band = max(1, bot - top)
+        pad_top = max(0, (h - band) // 2)
     body = bytearray()
     for y in range(h):
-        sy = min(base_h - 1, int((y + 0.5) * base_h / h))
+        if keep_scale:
+            sy = top + y - pad_top
+            if sy < top:
+                sy = top
+            elif sy >= bot:
+                sy = bot - 1
+        else:
+            sy = lo + min(int(span), max(0, int((y + 0.5) * span / h)))
         rstart = sy * base_w * 3
         dy = y + 0.5 - cy
         ady = abs(dy)
@@ -3653,6 +3651,11 @@ class IslandApp:
                 self._apply_morph()
             except Exception:
                 pass
+        # 新图的动画帧在空闲时补一遍，下一次悬停就是现成的
+        try:
+            self.root.after(200, self._morph_prewarm)
+        except Exception:
+            pass
 
     def _invalidate_fade(self):
         self._fade_frames = []
@@ -3948,12 +3951,12 @@ class IslandApp:
         h = int(round(self.h0 + self.grow * k))
         h = max(self.h0, min(self.h0 + self.grow + 1, h))
         if h != self.h:
-            self.h = h
             try:
                 img = self._panel_image() if h == self.h0 else self._morph_panel(h)
             except Exception:
                 img = None
-            if img is not None:
+            if img is not None:          # 底图没就绪就保持原样，绝不让内容漂出胶囊
+                self.h = h
                 self._panel = img
                 try:
                     self.canvas.itemconfigure(self._panel_item, image=img)
@@ -3967,7 +3970,7 @@ class IslandApp:
             self._body_dy = dy
 
     def _morph_panel(self, h):
-        """按高度取一帧胶囊底图；照片模式先用一次整幅重采样，再逐帧裁行套遮罩"""
+        """按高度取一帧胶囊底图；照片模式下直接拿当前底图的像素逐帧裁行套遮罩"""
         if self._photo_on and self._photos:
             base = self._photo_morph_base()
             if base is None:
@@ -3977,7 +3980,8 @@ class IslandApp:
             img = self._morph_cache.get(key)
             if img is None:
                 bw, bh, rows = base
-                img = make_morph_frame(self.root, self.w, h, bw, bh, rows)
+                img = make_morph_frame(self.root, self.w, h, bw, bh, rows,
+                                       margin=max(3, self.S(1) + 1))
                 self._morph_store(key, img)
             return img
         key = ("g", self.theme, self.w, h)
@@ -3988,22 +3992,10 @@ class IslandApp:
         return img
 
     def _photo_morph_base(self):
-        """照片动画素材：(宽, 高, RGB)；一张图各高度共用，只在换图 / 换主题时重算"""
-        if not (self._photo_on and self._photos):
+        """照片动画素材：直接用当前已渲好的这张底图（h0 高的原始像素），零额外开销"""
+        if not (self._photo_on and self._panel_raw is not None):
             return None
-        path = self._photos[self._photo_idx % len(self._photos)]
-        big_h = self.h0 + self.grow + 1
-        key = ("base", path, self.theme, self.w, big_h)
-        base = self._morph_cache.get(key)
-        if base is None:
-            try:
-                sw, sh, rows = self._photo_source(path)
-            except Exception:
-                return None
-            base = (self.w, big_h, make_photo_frame_base(
-                self.w, big_h, sw, sh, rows, PHOTO_SCRIM_TOP, PHOTO_SCRIM_BOTTOM))
-            self._morph_store(key, base)
-        return base
+        return (self.w, self.h0, self._panel_raw)
 
     def _morph_store(self, key, img):
         self._morph_cache[key] = img
