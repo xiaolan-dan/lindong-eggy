@@ -224,6 +224,19 @@ STRIP_W = (PAD_L + sum(c[2] for c in COLUMNS) + COL_GAP * (len(COLUMNS) - 1)
            + COL_GAP + GEAR_W + PAD_R)
 TOP_OFFSET = 6
 
+# 自适应：胶囊宽度按屏幕逻辑宽度取比例，窄屏缩小、宽屏适度放大
+FIT_RATIO = 0.45          # 目标宽度 ≈ 屏幕逻辑宽度的 45%
+FIT_MIN = 0.75
+FIT_MAX = 1.40
+FIT_MAX_PCT = 0.92        # 再宽也不超过屏幕的 92%
+
+# 交互：悬停向下"长"出来一点，带弹簧阻尼，回弹有轻微过冲（苹果式手感）
+MORPH_GROW = 7            # 悬停时向下多长出的逻辑高度
+MORPH_WIN_PAD = 3         # 窗口比最大胶囊再高一点，动画时边缘不被窗口裁掉
+SPRING_K = 190.0          # 弹簧刚度
+SPRING_D = 17.0           # 阻尼（越大越不弹）
+PRESS_DIP = 1.6           # 按下时内容下沉多少逻辑像素
+
 # 图片轮换：胶囊底色换成「轮换图/」里的图，居中裁剪铺满
 PHOTO_DIR = "轮换图"
 PHOTO_INTERVAL = 25       # 轮换间隔默认值（秒），设置面板里可改，存在配置里
@@ -795,6 +808,28 @@ def make_panel_image(master, w: int, h: int):
         edge = deep_rgb if sd > -1.0 else rim_rgb
         return _lerp(key_rgb, edge, cov)
 
+    def arc_rgb(x, dy, base_rgb):
+        """圆头（曲线段）：边缘带用 2×2 子采样算覆盖率，圆头转角更干净"""
+        dxq = abs(x + 0.5 - cx) - half
+        if dxq < 0.0:
+            dxq = 0.0
+        sd = sq(dxq * dxq + dy * dy) - r
+        if sd <= -2.6:
+            return base_rgb
+        if sd >= 1.2:
+            return key_rgb
+        cnt = 0
+        for ox in (0.25, 0.75):
+            qdx = abs(x + ox - cx) - half
+            if qdx < 0.0:
+                qdx = 0.0
+            for qdy in (dy - 0.25, dy + 0.25):
+                if sq(qdx * qdx + qdy * qdy) <= r:
+                    cnt += 1
+        cov = cnt * 0.25
+        edge = deep_rgb if sd > -1.0 else rim_rgb
+        return _lerp(key_rgb, edge, cov if cov < 1.0 else 1.0)
+
     body = bytearray()
     sq = math.sqrt
     for y in range(h):
@@ -816,17 +851,11 @@ def make_panel_image(master, w: int, h: int):
         if o_lo > 0:
             body += key_bytes * o_lo
         for x in range(o_lo, m_lo):              # 左圆头
-            dxq = abs(x + 0.5 - cx) - half
-            if dxq < 0.0:
-                dxq = 0.0
-            body += bytes(shade(sq(dxq * dxq + dy * dy) - r, base_rgb))
+            body += bytes(arc_rgb(x, dy, base_rgb))
         if m_hi >= m_lo:
             body += mid_bytes * (m_hi - m_lo + 1)
         for x in range(m_hi + 1, o_hi + 1):      # 右圆头
-            dxq = abs(x + 0.5 - cx) - half
-            if dxq < 0.0:
-                dxq = 0.0
-            body += bytes(shade(sq(dxq * dxq + dy * dy) - r, base_rgb))
+            body += bytes(arc_rgb(x, dy, base_rgb))
         tail = w - (o_hi + 1)
         if tail > 0:
             body += key_bytes * tail
@@ -1005,6 +1034,96 @@ def make_photo_panel_image(master, w: int, h: int, src_w: int, src_h: int,
         raise RuntimeError("photo panel bytes %d != %d" % (len(body), w * h * 3))
     # 顺带把原始像素交出去：淡入淡出要拿它跟下一张混合
     return _photo_from_ppm(master, w, h, bytes(body)), bytes(body)
+
+
+def make_photo_frame_base(w: int, h: int, src_w: int, src_h: int, src_rows,
+                          scrim_top: float, scrim_bot: float):
+    """照片按 w×h 重采样并压暗一次（最近邻，够动画用），返回整幅 RGB 字节"""
+    if src_w * h > w * src_h:
+        cw, chh = src_h * w / float(h), float(src_h)
+        x0, y0 = (src_w - cw) / 2.0, 0.0
+    else:
+        cw, chh = float(src_w), src_w * h / float(w)
+        x0, y0 = 0.0, (src_h - chh) / 2.0
+    ktop, kbot = 1.0 - scrim_top, 1.0 - scrim_bot
+    xs = [min(src_w - 1, int(x0 + (x + 0.5) * cw / w)) for x in range(w)]
+    body = bytearray()
+    for y in range(h):
+        f = ktop + (kbot - ktop) * (y / float(max(1, h - 1)))
+        sy = min(src_h - 1, int(y0 + (y + 0.5) * chh / h))
+        rowoff = sy * src_w
+        for sx in xs:
+            i = (rowoff + sx) * 3
+            body += bytes((int(src_rows[i] * f),
+                           int(src_rows[i + 1] * f),
+                           int(src_rows[i + 2] * f)))
+    return bytes(body)
+
+
+def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows):
+    """用预采样好的照片行 + 胶囊遮罩拼一帧：中间段整块拷贝，只有圆头要逐点算"""
+    key_rgb = _hex_rgb(KEY_COLOR)
+    key_bytes = bytes(key_rgb)
+    rim_rgb = _hex_rgb(BORDER)
+    deep_rgb = _hex_rgb(BORDER_DEEP)
+    x0, y0, x1, y1 = 1.5, 1.5, w - 1.5, h - 1.5
+    r = (y1 - y0) / 2.0
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    half = max(0.0, (x1 - x0) / 2.0 - r)
+    sq = math.sqrt
+    body = bytearray()
+    for y in range(h):
+        sy = min(base_h - 1, int((y + 0.5) * base_h / h))
+        rstart = sy * base_w * 3
+        dy = y + 0.5 - cy
+        ady = abs(dy)
+        if ady >= r + 1.2:
+            body += key_bytes * w
+            continue
+        arc = sq((r + 1.2) ** 2 - dy * dy)
+        o_lo = max(0, int(math.floor(cx - half - arc - 0.5)))
+        o_hi = min(w - 1, int(math.ceil(cx + half + arc - 0.5)))
+        m_lo = max(0, int(math.ceil(cx - half - 0.5)))
+        m_hi = min(w - 1, int(math.floor(cx + half - 0.5)))
+        sd_mid = ady - r
+        if o_lo > 0:
+            body += key_bytes * o_lo
+
+        def arc_px(x):
+            dxq = abs(x + 0.5 - cx) - half
+            if dxq < 0.0:
+                dxq = 0.0
+            sd = sq(dxq * dxq + dy * dy) - r
+            cov = 0.5 - sd
+            if cov <= 0.0:
+                return key_bytes
+            if cov > 1.0:
+                cov = 1.0
+            return bytes(_lerp(key_rgb, deep_rgb if sd > -1.0 else rim_rgb, cov))
+
+        for x in range(o_lo, m_lo):          # 左圆头
+            body += arc_px(x)
+        if m_hi >= m_lo:
+            if sd_mid <= -2.6:               # 直段整段是照片：一次拷过去
+                body += base_rows[rstart + m_lo * 3:rstart + (m_hi + 1) * 3]
+            else:                            # 这一行压在上下描边上：整段同色
+                cov = 0.5 - sd_mid
+                if cov <= 0.0:
+                    body += key_bytes * (m_hi - m_lo + 1)
+                else:
+                    if cov > 1.0:
+                        cov = 1.0
+                    edge = deep_rgb if sd_mid > -1.0 else rim_rgb
+                    body += bytes(_lerp(key_rgb, edge, cov)) * (m_hi - m_lo + 1)
+        for x in range(m_hi + 1, o_hi + 1):  # 右圆头
+            body += arc_px(x)
+        tail = w - (o_hi + 1)
+        if tail > 0:
+            body += key_bytes * tail
+
+    if len(body) != w * h * 3:
+        raise RuntimeError("morph frame bytes %d != %d" % (len(body), w * h * 3))
+    return _photo_from_ppm(master, w, h, bytes(body))
 
 
 def _png_bytes_rgb(w: int, h: int, rows) -> bytes:
@@ -2767,54 +2886,111 @@ def make_sticker_image(master, size: int, bg_rows, boost: float = 1.0):
     return img
 
 
+def _alpha_rows(raw, side: int, size: int, tint=(1.0, 1.0, 1.0)):
+    """把原图缩/放到 size×size 的 RGBA 行：缩小用 2×2 盒式平均，放大用双线性，
+    两条路径都能把边缘磨平（源图很小，直接最近邻会出硬台阶）"""
+    tr, tg, tb = tint
+    rows = []
+    if size <= side:
+        for y in range(size):
+            sy0 = int(y * side / size)
+            sy1 = max(sy0 + 1, int((y + 1) * side / size))
+            if sy1 >= side:
+                sy1 = side - 1
+            span_y = sy1 - sy0
+            row = bytearray()
+            for x in range(size):
+                sx0 = int(x * side / size)
+                sx1 = max(sx0 + 1, int((x + 1) * side / size))
+                if sx1 >= side:
+                    sx1 = side - 1
+                span_x = sx1 - sx0
+                r = g = b = a = 0
+                for oy in (0.25, 0.75):
+                    qy = min(side - 1, sy0 + int(span_y * oy))
+                    base = qy * side
+                    for ox in (0.25, 0.75):
+                        i = (base + min(side - 1, sx0 + int(span_x * ox))) * 4
+                        r += raw[i]
+                        g += raw[i + 1]
+                        b += raw[i + 2]
+                        a += raw[i + 3]
+                row += bytes((min(255, int(r * 0.25 * tr)),
+                              min(255, int(g * 0.25 * tg)),
+                              min(255, int(b * 0.25 * tb)),
+                              int(a * 0.25 + 0.5)))
+            rows.append(row)
+        return rows
+
+    k = side / float(size)
+    for y in range(size):
+        fy = (y + 0.5) * k - 0.5
+        iy = int(fy)
+        ty = fy - iy
+        if iy < 0:
+            iy, ty = 0, 0.0
+        if ty < 0.0:
+            ty = 0.0
+        elif ty > 1.0:
+            ty = 1.0
+        iy2 = min(side - 1, iy + 1)
+        row = bytearray()
+        for x in range(size):
+            fx = (x + 0.5) * k - 0.5
+            ix = int(fx)
+            tx = fx - ix
+            if ix < 0:
+                ix, tx = 0, 0.0
+            if tx < 0.0:
+                tx = 0.0
+            elif tx > 1.0:
+                tx = 1.0
+            ix2 = min(side - 1, ix + 1)
+            i00 = (iy * side + ix) * 4
+            i10 = (iy * side + ix2) * 4
+            i11 = (iy2 * side + ix) * 4
+            i12 = (iy2 * side + ix2) * 4
+            w00 = (1.0 - tx) * (1.0 - ty)
+            w10 = tx * (1.0 - ty)
+            w01 = (1.0 - tx) * ty
+            w11 = tx * ty
+            row += bytes((min(255, int((raw[i00] * w00 + raw[i10] * w10
+                                       + raw[i11] * w01 + raw[i12] * w11) * tr)),
+                          min(255, int((raw[i00 + 1] * w00 + raw[i10 + 1] * w10
+                                       + raw[i11 + 1] * w01 + raw[i12 + 1] * w11) * tg)),
+                          min(255, int((raw[i00 + 2] * w00 + raw[i10 + 2] * w10
+                                       + raw[i11 + 2] * w01 + raw[i12 + 2] * w11) * tb)),
+                          min(255, int(raw[i00 + 3] * w00 + raw[i10 + 3] * w10
+                                       + raw[i11 + 3] * w01 + raw[i12 + 3] * w11 + 0.5))))
+        rows.append(row)
+    return rows
+
+
 def make_avatar_alpha(master, size: int, tint=(1.0, 1.0, 1.0)):
     """头像贴纸（保留透明通道）：底色交给下层，渐变色 / 照片都能干净叠住"""
     raw, side = _avatar_data()
     size = max(8, int(size))
-    tr, tg, tb = tint
-    rows = []
-    for y in range(size):
-        sy = min(side - 1, max(0, int((y + 0.5) * side / size)))
-        row = bytearray()
-        for x in range(size):
-            sx = min(side - 1, max(0, int((x + 0.5) * side / size)))
-            i = (sy * side + sx) * 4
-            row += bytes((min(255, int(raw[i] * tr)),
-                          min(255, int(raw[i + 1] * tg)),
-                          min(255, int(raw[i + 2] * tb)),
-                          raw[i + 3]))
-        rows.append(row)
-    return _rgba_photo(master, size, size, rows)
+    return _rgba_photo(master, size, size, _alpha_rows(raw, side, size, tint))
 
 
 def make_sticker_alpha(master, size: int, boost: float = 1.0):
     """齿轮贴纸（保留透明通道）"""
     raw, side = _sticker_data()
     size = max(8, int(size))
-    rows = []
-    for y in range(size):
-        sy = min(side - 1, max(0, int((y + 0.5) * side / size)))
-        row = bytearray()
-        for x in range(size):
-            sx = min(side - 1, max(0, int((x + 0.5) * side / size)))
-            i = (sy * side + sx) * 4
-            row += bytes((min(255, int(raw[i] * boost)),
-                          min(255, int(raw[i + 1] * boost)),
-                          min(255, int(raw[i + 2] * boost)),
-                          raw[i + 3]))
-        rows.append(row)
-    return _rgba_photo(master, size, size, rows)
+    return _rgba_photo(master, size, size,
+                       _alpha_rows(raw, side, size, (boost, boost, boost)))
 
 
 class RingGauge:
-    """抗锯齿环形进度：底色按胶囊渐变逐行取色，边缘 4x 超采样"""
+    """抗锯齿环形进度：底色按胶囊渐变逐行取色，边缘按屏幕密度做 4 或 6 倍超采样"""
 
     SS = 4
 
     def __init__(self, master, diameter: int, band: float,
-                 track_hex: str, accent_hex: str, track_a: int = 255):
+                 track_hex: str, accent_hex: str, track_a: int = 255, ss: int = 4):
         self.master = master
         self.d = max(8, int(diameter))
+        self.ss = 4 if ss < 5 else 6
         self._track = _hex_rgb(track_hex)
         self._track_a = max(0, min(255, int(track_a)))
         self._accent = _hex_rgb(accent_hex)
@@ -2825,7 +3001,7 @@ class RingGauge:
 
     def _prepare(self, band: float):
         """只算几何：方位角 + 环覆盖率 + 外圈光晕覆盖率，颜色留到 render"""
-        d, ss = self.d, self.SS
+        d, ss = self.d, self.ss
         cc = d / 2.0
         r_out = cc - 0.6
         r_in = max(1.0, r_out - band)
@@ -3041,13 +3217,15 @@ class SettingsPanel:
 
         x = app.anchor_cx - self.w // 2
         x = max(S(8), min(x, app.root.winfo_screenwidth() - self.w - S(8)))
-        y = app.anchor_y + app.h + S(10)
+        y = app.anchor_y + app.h0 + S(9)
         self.top.geometry(f"{self.w}x{self.h}+{x}+{y}")
 
         fam = app.f_label.cget("family")
-        self.f_title = tkfont.Font(family=fam, size=11, weight="bold")
-        self.f_row = tkfont.Font(family=fam, size=8)
-        self.f_small = tkfont.Font(family=fam, size=7)
+        fs = app.fit
+        self.f_title = tkfont.Font(family=fam, size=max(9, int(round(11 * fs))),
+                                   weight="bold")
+        self.f_row = tkfont.Font(family=fam, size=max(7, int(round(8 * fs))))
+        self.f_small = tkfont.Font(family=fam, size=max(6, int(round(7 * fs))))
 
         self.canvas = tk.Canvas(self.top, bg=KEY_COLOR, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
@@ -3059,6 +3237,28 @@ class SettingsPanel:
         self.canvas.bind("<Motion>", self._on_motion)
         self.top.bind("<Escape>", lambda _e: self.close())
         self.top.lift()
+
+        # 苹果式的淡入：alpha 从 0 走到 1（系统不支持就跳过）
+        self._fade_step = 0
+        try:
+            self.top.wm_attributes("-alpha", 0.0)
+        except tk.TclError:
+            self._fade_step = 99
+        else:
+            self.top.after(16, self._fade_in)
+
+    def _fade_in(self):
+        if self._fade_step >= 99:
+            return
+        self._fade_step += 1
+        a = min(1.0, self._fade_step / 7.0)
+        try:
+            self.top.wm_attributes("-alpha", a)
+        except tk.TclError:
+            self._fade_step = 99
+            return
+        if a < 1.0:
+            self.top.after(16, self._fade_in)
 
     # ------------------------------------------------------------ 绘制
     def _keep(self, img):
@@ -3284,9 +3484,25 @@ class IslandApp:
         except Exception:
             pass
 
+        # 按屏幕大小算出整体缩放系数（窄屏缩、宽屏适度放大）
+        self.fit = self._fit_scale()
+        self._morph_cache = {}        # 动画各高度底图 {键: 位图}
+        self._morph_x = 0.0           # 悬停展开度 0..1
+        self._morph_v = 0.0
+        self._press_x = 0.0           # 按下压入量 0..1
+        self._press_v = 0.0
+        self._morph_job = None
+        self._body_dy = 0             # 内容当前位移（相对静止位）
+        self._hover = False
+        self._pressed = False
+        self._pw_steps = []           # 预渲染队列
+
         self._pick_fonts()
         self.w = self.S(STRIP_W)
         self.h = self.S(STRIP_H)
+        self.h0 = self.h
+        self.grow = self.S(MORPH_GROW)
+        self.win_h = self.h + self.grow + self.S(MORPH_WIN_PAD)
         self.anchor_cx = self.root.winfo_screenwidth() // 2
         self.anchor_y = self.S(TOP_OFFSET)
 
@@ -3344,7 +3560,20 @@ class IslandApp:
             return 96
 
     def S(self, v):
-        return int(round(v * self.scale))
+        return int(round(v * self.scale * self.fit))
+
+    def _fit_scale(self):
+        """按屏幕逻辑宽度决定整体缩放：目标宽度 ≈ 屏宽的 45%，夹在 0.75~1.4 之间"""
+        try:
+            sw_log = self.root.winfo_screenwidth() / max(1.0, self.scale)
+        except Exception:
+            return 1.0
+        if sw_log <= 0:
+            return 1.0
+        fit = (sw_log * FIT_RATIO) / float(STRIP_W)
+        fit = max(FIT_MIN, min(FIT_MAX, fit))
+        fit = min(fit, (sw_log * FIT_MAX_PCT) / float(STRIP_W))
+        return round(fit, 3)
 
     def _pick_fonts(self):
         fams = set(tkfont.families(self.root))
@@ -3353,9 +3582,11 @@ class IslandApp:
         num = next((f for f in ("Bahnschrift", "DIN Alternate", "Segoe UI")
                     if f in fams), ui)
         self._num_family, self._ui_family = num, ui
-        self.f_val = tkfont.Font(family=num, size=11, weight="bold")   # 主数值
-        self.f_label = tkfont.Font(family=ui, size=7)                  # 指标名
-        self.f_menu = tkfont.Font(family=ui, size=9)
+        fs = self.fit                                  # 字号跟着整体缩放
+        self.f_val = tkfont.Font(family=num, size=max(8, int(round(11 * fs))),
+                                 weight="bold")        # 主数值
+        self.f_label = tkfont.Font(family=ui, size=max(6, int(round(7 * fs))))
+        self.f_menu = tkfont.Font(family=ui, size=max(7, int(round(9 * fs))))
 
     def _bind(self):
         # 位置固定：左键拖动已禁用，只保留右键菜单
@@ -3364,7 +3595,7 @@ class IslandApp:
     # ------------------------------------------------------------ 窗口几何
     def _apply_geometry(self):
         x = self.anchor_cx - self.w // 2
-        self.root.geometry(f"{self.w}x{self.h}+{x}+{self.anchor_y}")
+        self.root.geometry(f"{self.w}x{self.win_h}+{x}+{self.anchor_y}")
 
     def _panel_row(self, y):
         return panel_row_color(y, self.h, _hex_rgb(BG_TOP), _hex_rgb(BG_BOTTOM))
@@ -3379,18 +3610,18 @@ class IslandApp:
         self._panel_raw = None
         img = self._panel_cache.get(self.theme)
         if img is None:
-            img = make_panel_image(self.root, self.w, self.h)
+            img = make_panel_image(self.root, self.w, self.h0)
             self._panel_cache[self.theme] = img
         return img
 
     def _photo_panel(self, path):
         """返回 (位图, 原始 RGB 像素)；后者留着做淡入淡出的两端"""
-        key = (path, self.w, self.h, self.theme)
+        key = (path, self.w, self.h0, self.theme)
         item = self._photo_panel_cache.get(key)
         if item is not None:
             return item
         sw, sh, rows = self._photo_source(path)
-        img, raw = make_photo_panel_image(self.root, self.w, self.h, sw, sh, rows,
+        img, raw = make_photo_panel_image(self.root, self.w, self.h0, sw, sh, rows,
                                           PHOTO_SCRIM_TOP, PHOTO_SCRIM_BOTTOM)
         item = (img, raw)
         self._photo_panel_cache[key] = item
@@ -3416,6 +3647,12 @@ class IslandApp:
             self.canvas.itemconfigure(self._panel_item, image=self._panel)
         except tk.TclError:
             pass
+        if self.h != self.h0:            # 悬停展开中换了图：重新按当前高度取一帧
+            self.h = self.h0
+            try:
+                self._apply_morph()
+            except Exception:
+                pass
 
     def _invalidate_fade(self):
         self._fade_frames = []
@@ -3521,7 +3758,7 @@ class IslandApp:
         t = i / float(PHOTO_FADE_STEPS)
         try:
             body = _blend_rgb(self._panel_raw, self._fade_next_raw, t)
-            img = _rgb_photo(self.root, self.w, self.h, body)
+            img = _rgb_photo(self.root, self.w, self.h0, body)
         except Exception:
             self._fade_next_raw = None
             return
@@ -3570,8 +3807,11 @@ class IslandApp:
     def _build(self):
         c = self.canvas
         c.delete("all")
+        self._morph_reset()
         self.w = self.S(STRIP_W)
-        self.h = self.S(STRIP_H)
+        self.h = self.h0 = self.S(STRIP_H)
+        self.grow = self.S(MORPH_GROW)
+        self.win_h = self.h + self.grow + self.S(MORPH_WIN_PAD)
         w, h = self.w, self.h
         sc = self._scene()
         self._avatar_imgs = sc["avatars"]
@@ -3622,6 +3862,172 @@ class IslandApp:
         c.tag_bind(self._gear, "<Leave>", self._gear_hover_off)
         c.tag_bind(self._gear, "<Button-1>", self._on_gear_click)
 
+        # 交互动画：除底图外所有内容统一打 body 标签，动画时只平移这一组
+        for it in c.find_all():
+            if it != self._panel_item:
+                c.addtag_withtag("body", it)
+        c.bind("<Enter>", self._morph_enter)
+        c.bind("<Leave>", self._morph_leave)
+        c.bind("<ButtonPress-1>", self._morph_press)
+        c.bind("<ButtonRelease-1>", self._morph_release)
+        self.root.after(1400, self._morph_prewarm)
+
+    # ------------------------------------------------------------ 交互动画（苹果式弹簧）
+    def _morph_reset(self):
+        """停掉动画并归位：重建 / 收起前都要回到静止态"""
+        if self._morph_job is not None:
+            try:
+                self.root.after_cancel(self._morph_job)
+            except Exception:
+                pass
+            self._morph_job = None
+        self._morph_x = self._morph_v = 0.0
+        self._press_x = self._press_v = 0.0
+        self._hover = self._pressed = False
+        if getattr(self, "_body_dy", 0):
+            try:
+                self.canvas.move("body", 0, -self._body_dy)
+            except tk.TclError:
+                pass
+            self._body_dy = 0
+        if getattr(self, "h0", None):
+            self.h = self.h0
+
+    def _morph_kick(self):
+        if self._morph_job is None and not self._collapsed:
+            self._morph_job = self.root.after(16, self._morph_tick)
+
+    def _morph_enter(self, _e=None):
+        if self._collapsed:
+            return
+        self._hover = True
+        self._morph_kick()
+
+    def _morph_leave(self, _e=None):
+        self._hover = False
+        self._pressed = False
+        self._morph_kick()
+
+    def _morph_press(self, _e=None):
+        if self._collapsed:
+            return
+        self._hover = True
+        self._pressed = True
+        self._morph_kick()
+
+    def _morph_release(self, _e=None):
+        self._pressed = False
+        self._morph_kick()
+
+    def _morph_tick(self):
+        """两个弹簧：悬停展开量 + 按下压入量，到点了就停，不空转"""
+        self._morph_job = None
+        dt = 0.016
+        tx = 1.0 if self._hover else 0.0
+        px = 1.0 if self._pressed else 0.0
+        busy = False
+        for name, target in (("_morph", tx), ("_press", px)):
+            x = getattr(self, name + "_x")
+            v = getattr(self, name + "_v")
+            v += ((target - x) * SPRING_K - v * SPRING_D) * dt
+            x += v * dt
+            if abs(x - target) < 0.004 and abs(v) < 0.04:
+                x, v = target, 0.0
+            else:
+                busy = True
+            setattr(self, name + "_x", x)
+            setattr(self, name + "_v", v)
+        self._apply_morph()
+        if busy:
+            self._morph_job = self.root.after(16, self._morph_tick)
+
+    def _apply_morph(self):
+        if getattr(self, "_panel_item", None) is None or self._collapsed:
+            return
+        k = max(0.0, min(1.12, self._morph_x))
+        h = int(round(self.h0 + self.grow * k))
+        h = max(self.h0, min(self.h0 + self.grow + 1, h))
+        if h != self.h:
+            self.h = h
+            try:
+                img = self._panel_image() if h == self.h0 else self._morph_panel(h)
+            except Exception:
+                img = None
+            if img is not None:
+                self._panel = img
+                try:
+                    self.canvas.itemconfigure(self._panel_item, image=img)
+                except tk.TclError:
+                    return
+        dip = int(round(self.S(PRESS_DIP) * self._press_x))
+        dy = (self.h - self.h0) // 2 + dip
+        delta = dy - self._body_dy
+        if delta:
+            self.canvas.move("body", 0, delta)
+            self._body_dy = dy
+
+    def _morph_panel(self, h):
+        """按高度取一帧胶囊底图；照片模式先用一次整幅重采样，再逐帧裁行套遮罩"""
+        if self._photo_on and self._photos:
+            base = self._photo_morph_base()
+            if base is None:
+                return None
+            path = self._photos[self._photo_idx % len(self._photos)]
+            key = ("p", path, self.theme, self.w, h)
+            img = self._morph_cache.get(key)
+            if img is None:
+                bw, bh, rows = base
+                img = make_morph_frame(self.root, self.w, h, bw, bh, rows)
+                self._morph_store(key, img)
+            return img
+        key = ("g", self.theme, self.w, h)
+        img = self._morph_cache.get(key)
+        if img is None:
+            img = make_panel_image(self.root, self.w, h)
+            self._morph_store(key, img)
+        return img
+
+    def _photo_morph_base(self):
+        """照片动画素材：(宽, 高, RGB)；一张图各高度共用，只在换图 / 换主题时重算"""
+        if not (self._photo_on and self._photos):
+            return None
+        path = self._photos[self._photo_idx % len(self._photos)]
+        big_h = self.h0 + self.grow + 1
+        key = ("base", path, self.theme, self.w, big_h)
+        base = self._morph_cache.get(key)
+        if base is None:
+            try:
+                sw, sh, rows = self._photo_source(path)
+            except Exception:
+                return None
+            base = (self.w, big_h, make_photo_frame_base(
+                self.w, big_h, sw, sh, rows, PHOTO_SCRIM_TOP, PHOTO_SCRIM_BOTTOM))
+            self._morph_store(key, base)
+        return base
+
+    def _morph_store(self, key, img):
+        self._morph_cache[key] = img
+        while len(self._morph_cache) > 48:          # 只留最近若干帧，别把内存吃满
+            self._morph_cache.pop(next(iter(self._morph_cache)))
+
+    def _morph_prewarm(self):
+        """空闲时逐帧预渲染，第一次悬停就不会卡在渲染上"""
+        self._pw_steps = ["base"] + list(range(self.h0 + 1, self.h0 + self.grow + 2))
+        self._pw_kick()
+
+    def _pw_kick(self):
+        if not self._pw_steps:
+            return
+        step = self._pw_steps.pop(0)
+        try:
+            if step == "base":
+                self._photo_morph_base()
+            else:
+                self._morph_panel(step)
+        except Exception:
+            return
+        self.root.after(80, self._pw_kick)
+
     def _scene(self):
         """生成 / 复用整条胶囊的位图组（图标都是带透明通道的，底色交给下层）"""
         cache_key = (self.theme, self._photo_on)
@@ -3644,12 +4050,14 @@ class IslandApp:
                      True: make_sticker_alpha(self.root, gear_d, boost=1.12)}
 
             rd = self.S(16)
+            # 高密度屏上圆环采样提到 6×，低密度保持 4×（5 个环一次算完，别拖启动）
+            rss = 6 if self.scale * self.fit >= 1.75 else 4
             if self._photo_on:      # 照片上：轨道用半透明白，才不会糊成一团
                 rings = {key: RingGauge(self.root, rd, self.S(2), "#FFFFFF", ACC[key],
-                                        track_a=96)
+                                        track_a=96, ss=rss)
                          for key, _label, _cw in COLUMNS}
             else:
-                rings = {key: RingGauge(self.root, rd, self.S(2), TRACK, ACC[key])
+                rings = {key: RingGauge(self.root, rd, self.S(2), TRACK, ACC[key], ss=rss)
                          for key, _label, _cw in COLUMNS}
 
             sc = {"avatars": avatars, "gears": gears, "rings": rings}
@@ -3709,6 +4117,7 @@ class IslandApp:
         if self._settings is not None:
             self._settings.close()
 
+        self._morph_reset()
         img = tk.PhotoImage(master=self.root, data=MINI_B64)
         mw, mh = img.width(), img.height()
         mini = tk.Toplevel(self.root)
@@ -3761,6 +4170,7 @@ class IslandApp:
         self._drag_off = None
         self.anchor_cx = self.root.winfo_screenwidth() // 2
         self.anchor_y = self.S(TOP_OFFSET)
+        self._morph_reset()
         self.root.deiconify()
         self._apply_geometry()
         try:
