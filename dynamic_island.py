@@ -3494,6 +3494,7 @@ class IslandApp:
         self._hover = False
         self._pressed = False
         self._pw_steps = []           # 预渲染队列
+        self._raw_path = None         # 当前 _panel_raw 属于哪张照片
 
         self._pick_fonts()
         self.w = self.S(STRIP_W)
@@ -3602,10 +3603,12 @@ class IslandApp:
     def _panel_image(self):
         """当前该用的胶囊底图：开了图片轮换就取轮到的那张，否则用主题渐变"""
         if self._photo_on and self._photos:
-            img, self._panel_raw = self._photo_panel(
-                self._photos[self._photo_idx % len(self._photos)])
+            path = self._photos[self._photo_idx % len(self._photos)]
+            img, self._panel_raw = self._photo_panel(path)
+            self._raw_path = path
             return img
         self._panel_raw = None
+        self._raw_path = None
         img = self._panel_cache.get(self.theme)
         if img is None:
             img = make_panel_image(self.root, self.w, self.h0)
@@ -3636,26 +3639,45 @@ class IslandApp:
         return src
 
     def _apply_panel(self):
-        """只换底图，不重建整条胶囊（轮换时用它，几乎不闪）"""
+        """只换底图，不重建整条胶囊（轮换时用它，几乎不闪）
+
+        展开态也必须保持「底图高度 == self.h == 内容位移」，否则会出现
+        底图还是 91 高、内容却已经下移 7px 的错位（内容探出胶囊底边）。
+        """
         if getattr(self, "_panel_item", None) is None:
             return
-        self._panel = self._panel_image()
         self._invalidate_fade()          # 底图变了，之前算的过渡帧就作废
+        new = self._panel_image()
+        self._morph_purge_photo()        # 新照片的动画帧全部重算，别混着旧图
+        if self.h != self.h0:
+            img = self._morph_panel(self.h)
+            if img is None:              # 取不到就干净地退回静止态
+                self._panel = new
+                self.h = self.h0
+                self._body_to(0)
+            else:
+                self._panel = img
+        else:
+            self._panel = new
         try:
             self.canvas.itemconfigure(self._panel_item, image=self._panel)
         except tk.TclError:
             pass
-        if self.h != self.h0:            # 悬停展开中换了图：重新按当前高度取一帧
-            self.h = self.h0
-            try:
-                self._apply_morph()
-            except Exception:
-                pass
         # 新图的动画帧在空闲时补一遍，下一次悬停就是现成的
         try:
             self.root.after(200, self._morph_prewarm)
         except Exception:
             pass
+
+    def _body_to(self, dy):
+        """把 content 移到指定位移（内部只发一次 move，避免重复叠加）"""
+        delta = dy - self._body_dy
+        if delta:
+            try:
+                self.canvas.move("body", 0, delta)
+            except tk.TclError:
+                return
+            self._body_dy = dy
 
     def _invalidate_fade(self):
         self._fade_frames = []
@@ -3693,7 +3715,8 @@ class IslandApp:
         new_idx = (self._photo_idx + step) % len(self._photos)
         self._fade_abort()
         self._photo_idx = new_idx
-        if (self._photo_on and self._fade_frames
+        # 过渡帧只有静止高度那一档，展开态直接换图，否则底图会比胶囊矮一截
+        if (self._photo_on and self.h == self.h0 and self._fade_frames
                 and self._fade_ready_for == self._photos[new_idx]
                 and getattr(self, "_panel_item", None) is not None):
             self._fade_anim = 0
@@ -3706,6 +3729,11 @@ class IslandApp:
         """每帧只是把算好的位图换上，不做任何像素运算，所以不会卡"""
         frames = self._fade_frames
         i = self._fade_anim
+        if self.h != self.h0:            # 中途展开了：过渡帧是 h0 高的，立刻收尾
+            self._fade_job = None
+            self._apply_panel()
+            self._prepare_next()
+            return
         if i >= len(frames):
             self._fade_job = None
             self._apply_panel()          # 收尾换回清晰的原图
@@ -3887,12 +3915,7 @@ class IslandApp:
         self._morph_x = self._morph_v = 0.0
         self._press_x = self._press_v = 0.0
         self._hover = self._pressed = False
-        if getattr(self, "_body_dy", 0):
-            try:
-                self.canvas.move("body", 0, -self._body_dy)
-            except tk.TclError:
-                pass
-            self._body_dy = 0
+        self._body_to(0)
         if getattr(self, "h0", None):
             self.h = self.h0
 
@@ -3964,10 +3987,7 @@ class IslandApp:
                     return
         dip = int(round(self.S(PRESS_DIP) * self._press_x))
         dy = (self.h - self.h0) // 2 + dip
-        delta = dy - self._body_dy
-        if delta:
-            self.canvas.move("body", 0, delta)
-            self._body_dy = dy
+        self._body_to(dy)
 
     def _morph_panel(self, h):
         """按高度取一帧胶囊底图；照片模式下直接拿当前底图的像素逐帧裁行套遮罩"""
@@ -3995,7 +4015,15 @@ class IslandApp:
         """照片动画素材：直接用当前已渲好的这张底图（h0 高的原始像素），零额外开销"""
         if not (self._photo_on and self._panel_raw is not None):
             return None
+        cur = self._photos[self._photo_idx % len(self._photos)]
+        if self._raw_path != cur:
+            return None                  # 底图还停在上一张（淡入淡出中），不能当素材
         return (self.w, self.h0, self._panel_raw)
+
+    def _morph_purge_photo(self):
+        """照片换了就把照片类缓存全清掉，避免有的高度还是旧图"""
+        for k in [k for k in self._morph_cache if k[0] == "p"]:
+            self._morph_cache.pop(k, None)
 
     def _morph_store(self, key, img):
         self._morph_cache[key] = img
