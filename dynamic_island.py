@@ -4,8 +4,9 @@
 单文件、纯标准库实现（tkinter + ctypes 直调 Win32 API），无需 pip 安装任何第三方包。
 Python 3.9+ / Windows 10 及以上。
 
-一条细长胶囊常驻屏幕顶部中央，CPU / 内存 / GPU / 磁盘 / 电池 五项指标
-全部直接显示在条内，每项左侧一个小圆环显示占用比例，不展开、不收起。
+一条细长胶囊常驻屏幕顶部中央，CPU / 内存 / GPU / 磁盘 / 电池 / 网络 六项指标
+全部直接显示在条内，每项左侧一个小圆环显示占用比例（网络那环画的是实时吞吐），
+不展开、不收起。
 
 两种底色：默认跟随主题渐变，也可以改成轮换播放
 `轮换图/` 里的图片（原图居中裁剪铺满，默认每 25 秒一张，
@@ -17,7 +18,7 @@ Python 3.9+ / Windows 10 及以上。
 交互：
     位置固定，不能拖动
     右键        -> 设置菜单（主题、刷新频率、图片轮换、开机自启、全屏自动隐藏、
-                   下一张图片、收起为图标、退出）
+                   打开任务管理器、下一张图片、收起为图标、退出）
     右侧齿轮    -> 单击同样打开设置菜单（快捷入口）
 """
 
@@ -41,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -225,18 +226,19 @@ COL_GAP = 10
 GEAR_W = 34           # 右侧设置快捷入口的占位宽度
 GEAR_D = 22           # 齿轮图标直径
 COLUMNS = [
-    ("cpu", "CPU", 66),
-    ("mem", "内存", 66),
-    ("gpu", "GPU", 88),
-    ("disk", "磁盘", 66),
-    ("bat", "电池", 86),
+    ("cpu", "CPU", 62),
+    ("mem", "内存", 62),
+    ("gpu", "GPU", 84),
+    ("disk", "磁盘", 62),
+    ("bat", "电池", 82),
+    ("net", "网络", 96),
 ]
 STRIP_W = (PAD_L + sum(c[2] for c in COLUMNS) + COL_GAP * (len(COLUMNS) - 1)
            + COL_GAP + GEAR_W + PAD_R)
 TOP_OFFSET = 6
 
 # 自适应：胶囊宽度按屏幕逻辑宽度取比例，窄屏缩小、宽屏适度放大
-FIT_RATIO = 0.45          # 目标宽度 ≈ 屏幕逻辑宽度的 45%
+FIT_RATIO = 0.50          # 目标宽度 ≈ 屏幕逻辑宽度的 50%（多了网络列，比例相应放宽）
 FIT_MIN = 0.75
 FIT_MAX = 1.40
 FIT_MAX_PCT = 0.92        # 再宽也不超过屏幕的 92%
@@ -548,6 +550,95 @@ class GpuProbe:
 
 
 # ================================================================ 采样线程
+# ---------------------------------------------------------------- 网络
+class _MIB_IFROW(ctypes.Structure):
+    """GetIfTable 里的一行网卡信息（只用到名字之前的几个计数字段，其余照结构补齐）"""
+    _fields_ = [
+        ("wszName", ctypes.c_wchar * 256),
+        ("dwIndex", wt.DWORD),
+        ("dwType", wt.DWORD),
+        ("dwMtu", wt.DWORD),
+        ("dwSpeed", wt.DWORD),
+        ("dwPhysAddrLen", wt.DWORD),
+        ("bPhysAddr", ctypes.c_ubyte * 8),
+        ("dwAdminStatus", wt.DWORD),
+        ("dwOperStatus", wt.DWORD),
+        ("dwLastChange", wt.DWORD),
+        ("dwInOctets", wt.DWORD),
+        ("dwOutOctets", wt.DWORD),
+        ("dwInUcastPkts", wt.DWORD),
+        ("dwInNUcastPkts", wt.DWORD),
+        ("dwInDiscards", wt.DWORD),
+        ("dwInErrors", wt.DWORD),
+        ("dwInUnknownProtos", wt.DWORD),
+        ("dwOutUcastPkts", wt.DWORD),
+        ("dwOutNUcastPkts", wt.DWORD),
+        ("dwOutDiscards", wt.DWORD),
+        ("dwOutErrors", wt.DWORD),
+        ("dwOutQLen", wt.DWORD),
+        ("dwDescrLen", wt.DWORD),
+        ("bDescr", ctypes.c_ubyte * 256),
+    ]
+
+IF_TYPE_LOOPBACK = 24
+IF_TYPE_TUNNEL = 131          # Teredo / 各类隧道适配器会把同一份流量再记一遍
+IF_OPER_CONNECTED = 4         # 4 = CONNECTED，5 = OPERATIONAL
+IF_TYPE_PHYSICAL = (6, 71, 243, 244)   # 以太网 / Wi-Fi / 移动宽带
+
+_iphlpapi = ctypes.WinDLL("iphlpapi.dll")
+_iphlpapi.GetIfTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.ULONG), wt.BOOL]
+_iphlpapi.GetIfTable.restype = wt.DWORD
+
+
+def net_counters():
+    """网卡累计收发字节：(rx, tx, 是否有可用网卡)
+
+    GetIfTable 会把同一块网卡拆成好几条记录（不同 GUID，计数器完全一样），
+    所以先按「网卡描述」归并、取组内最大值，再跨网卡求和，避免把流量乘 6 倍。
+    """
+    size = wt.ULONG(0)
+    _iphlpapi.GetIfTable(None, ctypes.byref(size), True)   # 先问需要多大缓冲
+    if size.value <= ctypes.sizeof(wt.DWORD):
+        return 0, 0, False
+    buf = ctypes.create_string_buffer(size.value)
+    if _iphlpapi.GetIfTable(buf, ctypes.byref(size), True) != 0:
+        return 0, 0, False
+    n = ctypes.cast(buf, ctypes.POINTER(wt.DWORD)).contents.value
+    row_size = ctypes.sizeof(_MIB_IFROW)
+    off = ctypes.sizeof(wt.DWORD)
+    groups = {}
+    up = False
+    for i in range(n):
+        row = _MIB_IFROW.from_buffer_copy(buf, off + i * row_size)
+        if row.dwType == IF_TYPE_LOOPBACK or row.dwType == IF_TYPE_TUNNEL:
+            continue
+        if row.dwType not in IF_TYPE_PHYSICAL:
+            continue
+        if row.dwOperStatus < IF_OPER_CONNECTED or row.dwSpeed <= 0:
+            continue
+        up = True
+        key = bytes(row.bDescr[:row.dwDescrLen]) or row.wszName
+        old = groups.get(key)
+        if old is None:
+            groups[key] = (row.dwInOctets, row.dwOutOctets)
+        else:
+            groups[key] = (max(old[0], row.dwInOctets),
+                           max(old[1], row.dwOutOctets))
+    rx = sum(g[0] for g in groups.values())
+    tx = sum(g[1] for g in groups.values())
+    return rx, tx, up
+
+
+def fmt_speed(bps) -> str:
+    """字节/秒 -> 3~4 个字符的短文本（1.2M / 85K / 512B），够窄才塞得进胶囊"""
+    v = max(0.0, float(bps))
+    for unit, k in (("G", 1024.0 ** 3), ("M", 1024.0 ** 2), ("K", 1024.0)):
+        if v >= k:
+            x = v / k
+            return ("%.1f%s" % (x, unit)) if x < 10 else ("%.0f%s" % (x, unit))
+    return "%dB" % int(v)
+
+
 class Sampler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -558,6 +649,7 @@ class Sampler(threading.Thread):
         self.cpu = CpuProbe()
         self.gpu = GpuProbe()
         self._tick = 0
+        self._net_prev = None
         self.interval = 1.0
 
     def stop(self):
@@ -579,6 +671,18 @@ class Sampler(threading.Thread):
         d["disk_total"], d["disk_free"] = _disk_info()
         d["battery"] = _battery_info()
         d["uptime"] = kernel32.GetTickCount64() / 1000.0
+        # 网络：累计计数器做差得到实时速率（32 位计数会回绕，按位掩码处理）
+        t_now = time.monotonic()
+        rx, tx, up = net_counters()
+        prev = self._net_prev
+        self._net_prev = (t_now, rx, tx, up)
+        if prev is None:
+            d["net_rx"] = d["net_tx"] = 0.0
+        else:
+            dt = max(0.2, t_now - prev[0])
+            d["net_rx"] = ((rx - prev[1]) & 0xFFFFFFFF) / dt
+            d["net_tx"] = ((tx - prev[2]) & 0xFFFFFFFF) / dt
+        d["net_on"] = up
         if self._tick % 3 == 0:
             self.gpu.sample()
         self._tick += 1
@@ -3896,6 +4000,7 @@ class IslandApp:
         txt_col = "#FFFFFF" if self._photo_on else TEXT
         div_col = "#FFFFFF" if self._photo_on else DIVIDER
         div_stipple = "gray50" if self._photo_on else ""
+        self._txt_fill = txt_col          # 断网时数值会临时变红，恢复时用这个
         self._cols = {}
         x = self.S(PAD_L)
         for idx, (key, label, cw) in enumerate(COLUMNS):
@@ -3909,8 +4014,10 @@ class IslandApp:
             tx = x + self.S(23)
             lab = c.create_text(tx, self.S(13), text=label, anchor="w",
                                 font=self.f_label, fill=ACC[key])
+            # 网络那列要放「↓速率 ↑速率」两个数，字号小一号才塞得下
             val = c.create_text(tx, self.S(28), text="--", anchor="w",
-                                font=self.f_val, fill=txt_col)
+                                font=(self.f_menu if key == "net" else self.f_val),
+                                fill=txt_col)
             self._cols[key] = {"lab": lab, "val": val, "ring": ring}
             x += cw_px + self.S(COL_GAP)
 
@@ -4289,6 +4396,23 @@ class IslandApp:
             c.itemconfigure(cols["bat"]["val"], text=f"{pct}%")
             self._set_ring("bat", pct / 100.0)
 
+        # 网络：两个箭头 + 实时速率；网卡全掉线时整列转红提示「断网」
+        net_on = d.get("net_on")
+        if "net" in cols:
+            if net_on is False:
+                c.itemconfigure(cols["net"]["lab"], text="网络 · 断", fill=COL_DOT_HOT)
+                c.itemconfigure(cols["net"]["val"], text="断网", fill=COL_DOT_HOT)
+                self._set_ring("net", 0.0)
+            else:
+                rx = d.get("net_rx", 0.0)
+                tx = d.get("net_tx", 0.0)
+                c.itemconfigure(cols["net"]["lab"], text="网络", fill=ACC["net"])
+                c.itemconfigure(cols["net"]["val"],
+                                text=f"↓{fmt_speed(rx)} ↑{fmt_speed(tx)}",
+                                fill=self._txt_fill)
+                # 环按 2 MB/s 满格算，日常百来 K 也能看见一小段弧
+                self._set_ring("net", min(1.0, (rx + tx) / (2.0 * 1024.0 * 1024.0)))
+
         imgs = self._avatar_imgs
         want = imgs[load_color(cpu)]
         if c.itemcget(self._avatar, "image") != str(want):
@@ -4301,6 +4425,21 @@ class IslandApp:
                 self._update()
         finally:
             self.root.after(int(self.refresh_interval * 1000) // 2 or 500, self._ui_tick)
+
+    # ------------------------------------------------------------ 打开任务管理器
+    def _open_taskmgr(self):
+        """调起 Windows 自带的任务管理器（右键菜单入口）"""
+        try:
+            os.startfile(os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                                      "System32", "taskmgr.exe"))
+            return
+        except Exception:
+            pass
+        try:
+            ctypes.windll.shell32.ShellExecuteW(None, "open", "taskmgr.exe",
+                                                None, None, 1)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 右键菜单
     def _on_menu(self, e):
@@ -4350,6 +4489,7 @@ class IslandApp:
                       command=lambda: self.advance_photo())
 
         m.add_separator()
+        m.add_command(label="打开任务管理器", command=self._open_taskmgr)
         m.add_command(label="收起为图标", command=self._collapse)
         m.add_command(label="退出", command=self._quit)
         try:
