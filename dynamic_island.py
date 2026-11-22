@@ -42,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -262,6 +262,10 @@ PHOTO_SCRIM_BOTTOM = 0.66 # 底部再压一点，做出上亮下暗的渐变
 # ================================================================ Win32 接口
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+try:
+    dwmapi = ctypes.WinDLL("dwmapi")
+except Exception:                                   # 极老系统上没有 DwmGetWindowAttribute
+    dwmapi = None
 
 
 class FILETIME(ctypes.Structure):
@@ -280,6 +284,11 @@ class MEMORYSTATUSEX(ctypes.Structure):
         ("ullAvailVirtual", ctypes.c_ulonglong),
         ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
     ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
@@ -3121,32 +3130,58 @@ class RingGauge:
     SS = 4
 
     def __init__(self, master, diameter: int, band: float,
-                 track_hex: str, accent_hex: str, track_a: int = 255, ss: int = 4):
+                 track_hex: str, accent_hex: str, track_a: int = 255, ss: int = 4,
+                 rim_hex: str = "", rim_w: float = 0.0,
+                 halo_hex: str = "#06090E", halo_a: int = 118):
         self.master = master
         self.d = max(8, int(diameter))
         self.ss = 4 if ss < 5 else 6
         self._track = _hex_rgb(track_hex)
         self._track_a = max(0, min(255, int(track_a)))
         self._accent = _hex_rgb(accent_hex)
+        # 描边：浅色主题下轨道和底色的对比太弱，环整体看着「没有边」，
+        # 所以在环外沿再压一圈深色，把圆轮廓勾出来
+        self._rim = _hex_rgb(rim_hex) if rim_hex else None
+        self._rim_w = max(0.0, float(rim_w))
+        # 外圈光晕：压暗一圈让环从照片/深色底上浮出来；浅色底上反而会糊边，可以关掉
+        self._halo = _hex_rgb(halo_hex)
+        self._halo_a = max(0, min(255, int(halo_a)))
         self.photo = tk.PhotoImage(master=master, width=self.d, height=self.d)
         self._rows = self._prepare(float(band))
         self._extent = None
         self.render(0.0)
 
     def _prepare(self, band: float):
-        """只算几何：方位角 + 环覆盖率 + 外圈光晕覆盖率，颜色留到 render"""
+        """只算几何：方位角 + 环覆盖率 + 外圈光晕覆盖率 + 描边覆盖率，颜色留到 render"""
         d, ss = self.d, self.ss
         cc = d / 2.0
         r_out = cc - 0.6
         r_in = max(1.0, r_out - band)
         edge = 0.9
         pad = 1.3                       # 光晕比环再宽一点，照片上才分得清
+        rim_on = self._rim is not None and self._rim_w > 0.0
+        r_rim = max(r_in + 0.3, r_out - self._rim_w) if rim_on else r_out
         rows = []
         for y in range(d):
             row = []
             for x in range(d):
                 px, py = x + 0.5 - cc, y + 0.5 - cc
                 dist = math.hypot(px, py)
+                rimc = 0.0
+                if rim_on:
+                    if abs(dist - r_rim) <= edge or abs(dist - r_out) <= edge:
+                        cnt = 0
+                        for sy in range(ss):
+                            for sx in range(ss):
+                                qx = x + (sx + 0.5) / ss - cc
+                                qy = y + (sy + 0.5) / ss - cc
+                                qd = math.hypot(qx, qy)
+                                if r_rim <= qd <= r_out:
+                                    cnt += 1
+                        rimc = cnt / float(ss * ss)
+                    else:
+                        rimc = 1.0 if r_rim <= dist <= r_out else 0.0
+
                 if abs(dist - r_in) <= edge or abs(dist - r_out) <= edge:
                     cnt = 0
                     for sy in range(ss):
@@ -3178,7 +3213,7 @@ class RingGauge:
                         halo = 1.0 if lo <= dist <= hi else 0.0
 
                 ang = math.degrees(math.atan2(px, -py)) % 360.0   # 0 = 正上方，顺时针
-                row.append((ang, cov, halo))
+                row.append((ang, cov, halo, rimc))
             rows.append(row)
         return rows
 
@@ -3188,16 +3223,24 @@ class RingGauge:
         if self._extent is not None and abs(extent - self._extent) < 1.0:
             return
         self._extent = extent
+        rim = self._rim
         rows = []
         for row in self._rows:
             buf = bytearray()
-            for ang, cov, halo in row:
+            for ang, cov, halo, rimc in row:
                 if cov > 0.0:
                     col = self._accent if ang <= extent else self._track
                     alpha = 255 if ang <= extent else self._track_a
-                    buf += bytes((col[0], col[1], col[2], int(alpha * cov + 0.5)))
-                elif halo > 0.0:
-                    buf += bytes((6, 9, 14, int(118.0 * halo + 0.5)))
+                    a = alpha * cov
+                    if rim is not None and rimc > 0.0:
+                        col = (int(col[0] + (rim[0] - col[0]) * rimc),
+                               int(col[1] + (rim[1] - col[1]) * rimc),
+                               int(col[2] + (rim[2] - col[2]) * rimc))
+                        a = max(a, 255.0 * rimc)
+                    buf += bytes((col[0], col[1], col[2], int(a + 0.5)))
+                elif halo > 0.0 and self._halo_a > 0:
+                    buf += bytes((self._halo[0], self._halo[1], self._halo[2],
+                                  int(self._halo_a * halo + 0.5)))
                 else:
                     buf += b"\x00\x00\x00\x00"
             rows.append(buf)
@@ -3426,10 +3469,13 @@ class SettingsPanel:
         c.create_text(cxx, S(23), text="×", font=self.f_title, fill=MUTED)
         self._hit(cxx - S(13), S(11), cxx + S(13), S(37), "close")
 
-        # 主题：四枚糖果胶囊
+        # 主题：四枚糖果胶囊（轮换模式下锁死在深色）
         c.create_text(pad, S(58), text="主题", anchor="w", font=self.f_row, fill=MUTED)
         self._seg_row(S(94), [(k, THEMES[k]["label"]) for k in THEME_ORDER],
-                      self.app.theme, "theme")
+                      self.app.theme, "theme", disabled=self.app._photo_on)
+        if self.app._photo_on:
+            c.create_text(w - pad, S(58), text="轮换模式固定深色", anchor="e",
+                          font=self.f_small, fill=MUTED)
 
         # 刷新频率
         c.create_text(pad, S(130), text="刷新频率", anchor="w", font=self.f_row, fill=MUTED)
@@ -3456,8 +3502,9 @@ class SettingsPanel:
         if up:
             c.create_text(w // 2, S(486), text=fmt_uptime(up), font=self.f_small, fill=MUTED)
 
-    def _seg_row(self, y, items, current, kind):
-        """一排等宽胶囊分段：既是主题选择也是刷新频率选择"""
+    def _seg_row(self, y, items, current, kind, disabled=False):
+        """一排等宽胶囊分段：既是主题选择也是刷新频率选择
+        disabled=True 时整排变灰、不响应点击（轮换模式锁深色用）"""
         c = self.canvas
         S = self.app.S
         pad = S(18)
@@ -3468,13 +3515,18 @@ class SettingsPanel:
         for i, (val, label) in enumerate(items):
             bx = pad + i * (seg_w + gap) + seg_w // 2
             on = (val == current)
-            img = self._pill(seg_w, seg_h, self.ACTIVE_BG if on else self.ITEM_BG,
-                             "" if on else self.ITEM_STROKE)
+            if disabled:
+                img = self._pill(seg_w, seg_h, self.ITEM_BG, self.ITEM_STROKE)
+                txt_col = TEXT if on else MUTED      # 当前主题亮一点，让人看得出锁在哪个
+            else:
+                img = self._pill(seg_w, seg_h, self.ACTIVE_BG if on else self.ITEM_BG,
+                                 "" if on else self.ITEM_STROKE)
+                txt_col = PILL_ON_TEXT if on else PILL_OFF_TEXT
             c.create_image(bx, y, image=img)
-            c.create_text(bx, y, text=label, font=self.f_row,
-                          fill=PILL_ON_TEXT if on else PILL_OFF_TEXT)
-            self._hit(bx - seg_w // 2, y - seg_h // 2,
-                      bx + seg_w // 2, y + seg_h // 2, kind, val)
+            c.create_text(bx, y, text=label, font=self.f_row, fill=txt_col)
+            if not disabled:
+                self._hit(bx - seg_w // 2, y - seg_h // 2,
+                          bx + seg_w // 2, y + seg_h // 2, kind, val)
 
     def _switch_row(self, y, label, on, kind):
         c = self.canvas
@@ -3558,9 +3610,7 @@ class SettingsPanel:
         self._build()
 
     def toggle_fullscreen(self):
-        self.app._fs_hide = not self.app._fs_hide
-        if not self.app._fs_hide and self.app._hidden_for_fullscreen:
-            self.app._show_island()
+        self.app.set_fs_hide(not self.app._fs_hide)
         self._build()
 
     def toggle_photo(self):
@@ -3660,10 +3710,22 @@ class IslandApp:
 
         cfg = _load_cfg()
         self.theme = cfg.get("theme") if cfg.get("theme") in THEMES else THEME_ORDER[0]
-        apply_theme(self.theme)
-
         self._photos = _scan_photos()
         self._photo_on = bool(cfg.get("photos", True)) and bool(self._photos)
+        # 轮换模式固定深色：配置里如果存着浅色 + 开着轮换，启动时就纠回来，
+        # 但把原来喜欢的主题记到 theme_pref，退掉轮换时还给他
+        self._theme_keep = None
+        if self._photo_on:
+            pref = cfg.get("theme_pref") or cfg.get("theme")
+            if pref in THEMES and pref != "dark":
+                self._theme_keep = pref
+            if self.theme != "dark":
+                self.theme = "dark"
+                _cfg_patch({"theme": "dark", "theme_pref": self._theme_keep or ""})
+        apply_theme(self.theme)
+        # 全屏自动隐藏：默认开，设置面板/右键菜单里关掉会记住
+        self._fs_hide = bool(cfg.get("fs_hide", True))
+
         try:
             self._photo_interval = max(2, min(600, int(cfg.get("photo_interval",
                                                                   PHOTO_INTERVAL))))
@@ -3821,9 +3883,32 @@ class IslandApp:
         self._fade_target = None
         self._fade_next_raw = None
 
+    def _apply_theme_quiet(self, name):
+        """只换配色 + 存配置，不重画（调用方自己会重建界面）"""
+        apply_theme(name)
+        self.theme = name
+        _cfg_patch({"theme": name})
+        self._scene_cache.clear()
+
     def set_photo_mode(self, on):
-        """开关图片轮换：底图和图标配色都要换，所以整条重画"""
-        self._photo_on = bool(on) and bool(self._photos)
+        """开关图片轮换：底图和图标配色都要换，所以整条重画
+
+        轮换模式固定用深色主题：照片上文字是白的，浅色主题的描边、分隔线、面板
+        都会露馅（浅描边压在照片上看不见），所以进轮换就切回深色，退出再还回去。
+        """
+        want = bool(on) and bool(self._photos)
+        if want:
+            if self.theme != "dark":
+                self._theme_keep = self.theme
+                self._apply_theme_quiet("dark")
+                _cfg_patch({"theme_pref": self._theme_keep})
+        else:
+            keep = getattr(self, "_theme_keep", None)
+            self._theme_keep = None
+            if keep and keep != "dark":
+                self._apply_theme_quiet(keep)
+            _cfg_patch({"theme_pref": ""})
+        self._photo_on = want
         _cfg_patch({"photos": self._photo_on})
         if getattr(self, "_panel_item", None) is None:
             return
@@ -4209,14 +4294,23 @@ class IslandApp:
                      True: make_sticker_alpha(self.root, gear_d, boost=1.12)}
 
             rd = self.S(16)
-            # 高密度屏上圆环采样提到 6×，低密度保持 4×（5 个环一次算完，别拖启动）
+            # 高密度屏上圆环采样提到 6×，低密度保持 4×（6 个环一次算完，别拖启动）
             rss = 6 if self.scale * self.fit >= 1.75 else 4
+            # 浅色主题的轨道色和胶囊底色太接近，整圈看着「没有边」——
+            # 把轨道往正文色压深一点（不动描边，避免在 16px 环上出现锯齿）
+            rim_w = 0.0
+            light_rim = (self.theme != "dark" and not self._photo_on)
+            track_hex = TRACK
+            if light_rim:
+                track_hex = _rgb_hex(_lerp(_hex_rgb(TRACK), _hex_rgb(TEXT), 0.30))
             if self._photo_on:      # 照片上：轨道用半透明白，才不会糊成一团
                 rings = {key: RingGauge(self.root, rd, self.S(2), "#FFFFFF", ACC[key],
                                         track_a=96, ss=rss)
                          for key, _label, _cw in COLUMNS}
             else:
-                rings = {key: RingGauge(self.root, rd, self.S(2), TRACK, ACC[key], ss=rss)
+                rings = {key: RingGauge(self.root, rd, self.S(2), track_hex, ACC[key],
+                                        ss=rss, rim_hex="", rim_w=0.0,
+                                        halo_a=(0 if light_rim else 118))
                          for key, _label, _cw in COLUMNS}
 
             sc = {"avatars": avatars, "gears": gears, "rings": rings}
@@ -4471,6 +4565,9 @@ class IslandApp:
         for key in THEME_ORDER:
             tsub.add_radiobutton(label=THEMES[key]["label"], variable=self._theme_var,
                                  value=key,
+                                 # 轮换模式锁死深色：其它三档直接灰掉
+                                 state=("normal" if (not self._photo_on or key == "dark")
+                                        else "disabled"),
                                  command=lambda k=key: self.set_theme(k))
         m.add_cascade(label="主题", menu=tsub)
 
@@ -4502,12 +4599,22 @@ class IslandApp:
         self.refresh_interval = float(val)
 
     def set_theme(self, name):
-        """切主题：换配色 -> 存配置 -> 长条和面板一起重画"""
+        """切主题：换配色 -> 存配置 -> 长条和面板一起重画
+
+        轮换模式下只允许深色：照片当底图时，浅色主题的白描边、浅分隔线全都会
+        糊在画面里，所以这里直接把其它主题的请求挡掉。
+        """
         if name not in THEMES:
             return
+        if self._photo_on and name != "dark":
+            return                      # 面板里那一排本来就是灰的，这里再兜一层
         apply_theme(name)
         self.theme = name
-        _cfg_patch({"theme": name})
+        if self._photo_on:
+            _cfg_patch({"theme": name})
+        else:
+            # 平稳模式下选的主题就是「轮换关掉后该回到的那套」，一起存下来
+            _cfg_patch({"theme": name, "theme_pref": name})
         self._scene_cache.clear()
         self.canvas.delete("all")
         self._cols = {}
@@ -4577,10 +4684,15 @@ class IslandApp:
             pass
 
     # ------------------------------------------------------------ 全屏自动隐藏
-    def _set_fs_hide(self):
-        self._fs_hide = bool(self._fs_var.get())
+    def set_fs_hide(self, on):
+        """开关全屏自动隐藏，顺便记住选择（下次启动还是这个状态）"""
+        self._fs_hide = bool(on)
+        _cfg_patch({"fs_hide": self._fs_hide})
         if not self._fs_hide and self._hidden_for_fullscreen:
             self._show_island()
+
+    def _set_fs_hide(self):
+        self.set_fs_hide(bool(self._fs_var.get()))
 
     def _fullscreen_tick(self):
         try:
@@ -4588,9 +4700,18 @@ class IslandApp:
                 if self._is_fullscreen_foreground():
                     if not self._hidden_for_fullscreen:
                         self._hidden_for_fullscreen = True
+                        # 面板还开着就一起收掉，不然只剩一个孤零零的小窗
+                        if self._settings is not None:
+                            try:
+                                self._settings.close()
+                            except Exception:
+                                pass
+                            self._settings = None
                         self.root.withdraw()
                 elif self._hidden_for_fullscreen:
                     self._show_island()
+            elif self._hidden_for_fullscreen:
+                self._show_island()
         finally:
             self.root.after(1500, self._fullscreen_tick)
 
@@ -4604,6 +4725,8 @@ class IslandApp:
             pass
 
     def _is_fullscreen_foreground(self):
+        """前台窗口是不是正在全屏：拿它的矩形和所在显示器的矩形比，
+        正好铺满（留 2px 容差、且没有溢出）才算全屏。多屏也按窗口所在的显示器算。"""
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return False
@@ -4614,12 +4737,39 @@ class IslandApp:
         user32.GetClassNameW(hwnd, buf, 256)
         if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd", "MultitaskingViewFrame"):
             return False
+        # 最小化 / 不可见的窗口不算（切到桌面时前台窗口可能就是这种）
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return False
+        # UWP 会被 DWM「隐身」（切走但还占着前台），这种不是真的在全屏
+        if dwmapi is not None:
+            try:
+                cloaked = ctypes.c_int(0)
+                dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked),
+                                             ctypes.sizeof(cloaked))
+                if cloaked.value:
+                    return False
+            except Exception:
+                pass
         rect = wt.RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return False
-        sw = user32.GetSystemMetrics(0)
-        sh = user32.GetSystemMetrics(1)
-        return rect.left <= 1 and rect.top <= 1 and rect.right >= sw - 1 and rect.bottom >= sh - 1
+        # 最大化窗口的矩形也比屏幕大一圈（左右各溢出 7~8px），必须先排掉，
+        # 否则一最大化任何窗口，胶囊就以为进了全屏
+        if user32.IsZoomed(hwnd):
+            return False
+        hmon = user32.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not hmon or not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return False
+        r = mi.rcMonitor
+        tol = 2
+        covered = (rect.left <= r.left + tol and rect.top <= r.top + tol
+                   and rect.right >= r.right - tol and rect.bottom >= r.bottom - tol)
+        # 真全屏是「正好等于屏幕」，超出屏幕太多的一定是带边框的窗口
+        overflow = (max(0, r.left - rect.left) + max(0, rect.right - r.right)
+                    + max(0, r.top - rect.top) + max(0, rect.bottom - r.bottom))
+        return covered and overflow <= 4
 
     # ------------------------------------------------------------ 启动
     def run(self):
