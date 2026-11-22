@@ -1037,14 +1037,15 @@ def make_photo_panel_image(master, w: int, h: int, src_w: int, src_h: int,
 
 
 def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows,
-                     margin: int = 3, keep_scale: bool = True):
+                     margin: int = 3, zoom: bool = True):
     """用预采样好的照片行 + 胶囊遮罩拼一帧：中间段整块拷贝，只有圆头要逐点算
 
-    base_rows 是 h0 高那种胶囊的**成品像素**，外圈 1~2px 是描边 / 抠色，
-    所以取行时只从 [margin, base_h-1-margin] 这一段里抽，避免把边缘色带进内部。
+    base_rows 是 h0 高那种胶囊的**成品像素**，外圈 1~2px 是描边 / 抠色。
 
-    keep_scale=True 时 pixel 1:1（不拉伸照片，变高的那几行用边缘行外延补齐），
-    这样悬停展开时人脸不会纵向变长；False 则把整段拉伸铺满 h 行。
+    zoom=True（默认）：照片跟着胶囊等比放大 —— 取底图居中 (base_w/z, base_h/z)
+    区域铺满 w×h（z = h/base_h），所以展开时画面是「放大」而不是「拉长」，
+    取景窗本身就排除了底图外圈的描边/抠色，不用再躲 margin。
+    zoom=False：把 [margin, base_h-1-margin] 整段拉伸铺满 h 行（老做法）。
     """
     key_rgb = _hex_rgb(KEY_COLOR)
     key_bytes = bytes(key_rgb)
@@ -1058,20 +1059,18 @@ def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows
     lo = max(0, min(base_h - 1, margin))
     hi = max(lo + 1, base_h - margin)
     span = float(hi - lo)
-    if keep_scale:
-        top, bot = lo, hi                             # 真正用来 1:1 显示的行区间
-        band = max(1, bot - top)
-        pad_top = max(0, (h - band) // 2)
+    if zoom:
+        z = max(1.0, h / float(base_h))
+        bw, bh = base_w / z, base_h / z
+        ox, oy = (base_w - bw) / 2.0, (base_h - bh) / 2.0
+        xs3 = [min(base_w - 1, max(0, int(ox + (x + 0.5) * bw / w))) * 3 for x in range(w)]
+        ys = [min(base_h - 1, max(0, int(oy + (y + 0.5) * bh / h))) for y in range(h)]
+    else:
+        xs3 = None
+        ys = [lo + min(int(span), max(0, int((y + 0.5) * span / h))) for y in range(h)]
     body = bytearray()
     for y in range(h):
-        if keep_scale:
-            sy = top + y - pad_top
-            if sy < top:
-                sy = top
-            elif sy >= bot:
-                sy = bot - 1
-        else:
-            sy = lo + min(int(span), max(0, int((y + 0.5) * span / h)))
+        sy = ys[y]
         rstart = sy * base_w * 3
         dy = y + 0.5 - cy
         ady = abs(dy)
@@ -1102,8 +1101,12 @@ def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows
         for x in range(o_lo, m_lo):          # 左圆头
             body += arc_px(x)
         if m_hi >= m_lo:
-            if sd_mid <= -2.6:               # 直段整段是照片：一次拷过去
-                body += base_rows[rstart + m_lo * 3:rstart + (m_hi + 1) * 3]
+            if sd_mid <= -2.6:               # 直段整段是照片
+                if xs3 is None:
+                    body += base_rows[rstart + m_lo * 3:rstart + (m_hi + 1) * 3]
+                else:
+                    body += b"".join([base_rows[rstart + o:rstart + o + 3]
+                                      for o in xs3[m_lo:m_hi + 1]])
             else:                            # 这一行压在上下描边上：整段同色
                 cov = 0.5 - sd_mid
                 if cov <= 0.0:
