@@ -44,6 +44,17 @@ APP_NAME = "灵动岛 · 硬件状态"
 APP_VERSION = "3.0"
 SCRIPT_PATH = os.path.abspath(__file__)
 
+# 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
+# APP_DIR = 程序/脚本所在目录（配置、用户自备素材放这儿）
+# RES_DIR = 只读资源目录（源码模式就是同一个目录；exe 模式是解包目录）
+FROZEN = bool(getattr(sys, "frozen", False))
+if FROZEN:
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = os.path.dirname(SCRIPT_PATH)
+    RES_DIR = APP_DIR
+
 # ---------------------------------------------------------------- 主题配色
 # 每个主题就是一组颜色名 -> 颜色值。所有自绘函数都在运行时读这些模块级名字，
 # 所以 apply_theme() 改写它们之后，重画一遍界面就换主题了。
@@ -1173,14 +1184,22 @@ def _rgb_photo(master, w: int, h: int, body: bytes):
 
 
 def _scan_photos():
-    """扫描脚本旁的 轮换图/ 目录，按文件名排序返回 PNG 路径（Tk 只认 PNG/GIF，用 PNG）"""
-    folder = os.path.join(os.path.dirname(SCRIPT_PATH), PHOTO_DIR)
-    try:
-        names = sorted(os.listdir(folder))
-    except OSError:
-        return []
-    return [os.path.join(folder, n) for n in names
-            if n.lower().endswith(".png") and os.path.isfile(os.path.join(folder, n))]
+    """扫描 轮换图/ 目录，按文件名排序返回 PNG 路径（Tk 只认 PNG/GIF，用 PNG）
+
+    exe 版优先读「exe 旁边的 轮换图」，这样用户想换图直接往那儿丢就行；
+    没有就退回打包进 exe 里的那份（sys._MEIPASS）。
+    """
+    for base in (APP_DIR, RES_DIR):
+        folder = os.path.join(base, PHOTO_DIR)
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        out = [os.path.join(folder, n) for n in names
+               if n.lower().endswith(".png") and os.path.isfile(os.path.join(folder, n))]
+        if out:
+            return out
+    return []
 
 
 AVATAR_B64 = (
@@ -4396,6 +4415,13 @@ class IslandApp:
         try:
             if self._autostart_enabled():
                 os.remove(path)
+            elif FROZEN:
+                content = (
+                    'Set sh = CreateObject("WScript.Shell")\r\n'
+                    f'sh.Run Chr(34) & "{sys.executable}" & Chr(34), 0, False\r\n'
+                )
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
             else:
                 pyw = sys.executable.replace("python.exe", "pythonw.exe")
                 if not os.path.exists(pyw):

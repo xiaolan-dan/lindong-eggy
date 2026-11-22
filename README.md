@@ -25,6 +25,17 @@ python dynamic_island.py
 
 （`启动灵动岛.bat` 会优先用 `pythonw.exe` 启动，所以不会弹出黑色命令行窗口。）
 
+**不想装 Python**：直接下 `灵动岛.exe`（GitHub Releases 里那个），双击就能跑。单文件、免安装、约 14 MB，首次启动要解包，慢一两秒是正常的。
+
+打包自己改过的版本：
+
+```bat
+pip install pyinstaller
+打包exe.bat
+```
+
+产物在 `dist\灵动岛.exe`，`轮换图/` 会一起打进去。想让 exe 读你自己的图，在 exe 旁边放一个 `轮换图/` 即可 —— 程序优先读外部目录，没有再退回内置的那份。
+
 ## 文件结构
 
 | 路径 | 说明 |
@@ -32,6 +43,7 @@ python dynamic_island.py
 | `dynamic_island.py` | 全部程序，单文件；图标、小图、圆环位图都以 base64 内嵌，运行时不读外部文件 |
 | `轮换图/` | 图片轮换用的 PNG（`01.png` … `16.png`），脚本启动时扫这里；没有这个目录就自动退回渐变底 |
 | `启动灵动岛.bat` | 双击启动，按 `pythonw` → `pyw -3` → PATH 里的 `pythonw` 依次找解释器 |
+| `打包exe.bat` | 一键用 PyInstaller 打成 `dist\灵动岛.exe`（需要 `pip install pyinstaller`） |
 | `预览.png` / `预览-四主题.png` / `预览-图片轮换.png` | 截图与四主题对比图、图片轮换效果图，只用于 README |
 | `素材/` | 制作脚本时用的原图备份（程序本身不需要） |
 | `素材/轮换原图/` + `素材/make_photos.py` | 轮换图的原始图，以及把它们按胶囊比例裁成 PNG 的生成脚本 |

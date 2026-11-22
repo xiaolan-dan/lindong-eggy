@@ -17,3 +17,6 @@ desktop.ini
 build/
 dist/
 *.spec
+
+# 本地快照备份
+.backup/
