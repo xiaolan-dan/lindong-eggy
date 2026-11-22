@@ -42,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -262,6 +262,12 @@ PHOTO_SCRIM_BOTTOM = 0.66 # 底部再压一点，做出上亮下暗的渐变
 # ================================================================ Win32 接口
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+try:
+    shell32.SHQueryUserNotificationState.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    shell32.SHQueryUserNotificationState.restype = ctypes.c_long
+except Exception:
+    pass
 try:
     dwmapi = ctypes.WinDLL("dwmapi")
 except Exception:                                   # 极老系统上没有 DwmGetWindowAttribute
@@ -289,6 +295,38 @@ class MEMORYSTATUSEX(ctypes.Structure):
 class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
                 ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+
+# 全屏判断用到的几个 API 先把签名钉死：64 位下 HWND/HMONITOR 是 8 字节指针，
+# 不声明 restype 会被 ctypes 当 int 截断，拿去比较就会「怎么都不对」
+try:
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = [ctypes.c_void_p, wt.UINT]
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
+    user32.IsZoomed.argtypes = [ctypes.c_void_p]
+    user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    user32.IsIconic.argtypes = [ctypes.c_void_p]
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wt.DWORD]
+    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    user32.GetClassNameW.argtypes = [ctypes.c_void_p, wt.LPWSTR, ctypes.c_int]
+    user32.GetParent.restype = ctypes.c_void_p
+    user32.GetParent.argtypes = [ctypes.c_void_p]
+except Exception:
+    pass
+
+
+def quns_state() -> int:
+    """Windows 自己那套「前台是不是全屏程序」的判断
+    （SHQueryUserNotificationState：2=有全屏应用 3=D3D 独占全屏 4=演示模式 7=商店应用全屏）。
+    浏览器 F11、视频全屏、独占全屏游戏都会落到 2/3，比拿窗口矩形猜靠谱得多。"""
+    try:
+        n = ctypes.c_int(0)
+        shell32.SHQueryUserNotificationState(ctypes.byref(n))
+        return int(n.value)
+    except Exception:
+        return 0
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
@@ -3702,6 +3740,7 @@ class IslandApp:
         self._drag_off = None
         self._hidden_for_fullscreen = False
         self._fs_hide = False
+        self._fs_streak = 0          # 全屏判断的连续计数，用来消抖
         self.refresh_interval = 1.0
         self._cpu_name, self._mhz = _cpu_info()
 
@@ -4696,24 +4735,49 @@ class IslandApp:
 
     def _fullscreen_tick(self):
         try:
-            if self._fs_hide:
-                if self._is_fullscreen_foreground():
-                    if not self._hidden_for_fullscreen:
-                        self._hidden_for_fullscreen = True
-                        # 面板还开着就一起收掉，不然只剩一个孤零零的小窗
-                        if self._settings is not None:
-                            try:
-                                self._settings.close()
-                            except Exception:
-                                pass
-                            self._settings = None
-                        self.root.withdraw()
-                elif self._hidden_for_fullscreen:
-                    self._show_island()
-            elif self._hidden_for_fullscreen:
+            fs, detail = self._fullscreen_probe()
+            prev = self._fs_streak
+            if fs:
+                self._fs_streak = min(3, self._fs_streak + 1)
+            else:
+                self._fs_streak = max(-3, self._fs_streak - 1)
+            if self._fs_streak != prev:
+                self._fs_trace("streak=%+d %s%s" % (self._fs_streak, detail,
+                                                   "" if self._fs_hide else " [switch off]"))
+            # 隐藏要连续两拍（约 3 秒）确认，免得切全屏那一下闪一下就藏；
+            # 退出全屏一拍就回来（约 1.5 秒）
+            if self._fs_hide and self._fs_streak >= 2:
+                if not self._hidden_for_fullscreen:
+                    self._hidden_for_fullscreen = True
+                    # 面板还开着就一起收掉，不然只剩一个孤零零的小窗
+                    if self._settings is not None:
+                        try:
+                            self._settings.close()
+                        except Exception:
+                            pass
+                        self._settings = None
+                    self._fs_trace("hide " + detail)
+                    self.root.withdraw()
+            elif self._hidden_for_fullscreen and (self._fs_streak <= -1 or not self._fs_hide):
+                self._fs_trace("show " + detail)
                 self._show_island()
         finally:
             self.root.after(1500, self._fullscreen_tick)
+
+    def _fs_trace(self, msg):
+        """全屏隐藏的取证日志：%LOCALAPPDATA%\\LINDONG-EGGY\\fs.log，超过 400KB 自动截半。
+        只在「藏起来 / 放出来」这种状态翻转时写，平时不产生任何 IO。"""
+        try:
+            path = os.path.join(_cfg_dir(), "fs.log")
+            if os.path.exists(path) and os.path.getsize(path) > 400 * 1024:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    tail = f.readlines()[-1000:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(tail)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%m-%d %H:%M:%S"), msg))
+        except Exception:
+            pass
 
     def _show_island(self):
         self._hidden_for_fullscreen = False
@@ -4724,59 +4788,110 @@ class IslandApp:
         except Exception:
             pass
 
-    def _is_fullscreen_foreground(self):
-        """前台窗口是不是正在全屏：拿它的矩形和所在显示器的矩形比，
-        正好铺满（留 2px 容差、且没有溢出）才算全屏。多屏也按窗口所在的显示器算。"""
+    def _fullscreen_probe(self):
+        """判断前台是不是真全屏，顺手返回一句人话描述（写日志用）。
+        三路判断，任一命中就算全屏：
+        1) SHQueryUserNotificationState 报「有全屏程序」—— 独占全屏游戏、F11 浏览器、
+           播放器全屏都会走这条，是 Windows 自己给系统的信号，最可信；
+        2) 前台顶层窗口（先 GetAncestor 拉到顶层）矩形覆盖所在显示器 ≥95% 且左上角贴边；
+        3) 以上都先排除：自己的窗口、桌面/任务栏、最大化窗口、cloaked UWP、最小化/隐藏。
+        """
+        st = quns_state()
+        if st in (2, 3, 4, 7):
+            return True, "quns=%d" % st
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
-            return False
+            return False, "no-fg quns=%d" % st
+        # 前台经常是子窗口（游戏渲染窗、浏览器渲染层），拉到顶层再量
+        try:
+            root_hwnd = user32.GetAncestor(hwnd, 2) or hwnd          # GA_ROOT
+        except Exception:
+            root_hwnd = hwnd
         own = self.root.winfo_id()
-        if hwnd == own or hwnd == user32.GetParent(own):
-            return False
+        try:
+            own_root = user32.GetAncestor(own, 2) or own
+        except Exception:
+            own_root = own
+        if hwnd == own or root_hwnd in (own, own_root):
+            return False, "self quns=%d" % st
         buf = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, buf, 256)
-        if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd", "MultitaskingViewFrame"):
-            return False
+        user32.GetClassNameW(root_hwnd, buf, 256)
+        cls = buf.value
+        if cls in ("Progman", "WorkerW", "Shell_TrayWnd", "MultitaskingViewFrame"):
+            return False, "shell:%s quns=%d" % (cls, st)
         # 最小化 / 不可见的窗口不算（切到桌面时前台窗口可能就是这种）
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-            return False
+        if not user32.IsWindowVisible(root_hwnd) or user32.IsIconic(root_hwnd):
+            return False, "hidden:%s quns=%d" % (cls, st)
         # UWP 会被 DWM「隐身」（切走但还占着前台），这种不是真的在全屏
         if dwmapi is not None:
             try:
                 cloaked = ctypes.c_int(0)
-                dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked),
+                dwmapi.DwmGetWindowAttribute(root_hwnd, 14, ctypes.byref(cloaked),
                                              ctypes.sizeof(cloaked))
                 if cloaked.value:
-                    return False
+                    return False, "cloaked:%s quns=%d" % (cls, st)
             except Exception:
                 pass
         rect = wt.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            return False
-        # 最大化窗口的矩形也比屏幕大一圈（左右各溢出 7~8px），必须先排掉，
-        # 否则一最大化任何窗口，胶囊就以为进了全屏
-        if user32.IsZoomed(hwnd):
-            return False
-        hmon = user32.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
+        if not user32.GetWindowRect(root_hwnd, ctypes.byref(rect)):
+            return False, "norect:%s quns=%d" % (cls, st)
+        # 最大化窗口的矩形比屏幕还大一圈，且 IsZoomed 为真 —— 先排掉
+        if user32.IsZoomed(root_hwnd):
+            return False, "zoomed:%s quns=%d" % (cls, st)
+        hmon = user32.MonitorFromWindow(root_hwnd, 2)      # MONITOR_DEFAULTTONEAREST
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(MONITORINFO)
         if not hmon or not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            return False
+            return False, "nomon:%s quns=%d" % (cls, st)
         r = mi.rcMonitor
-        tol = 2
-        covered = (rect.left <= r.left + tol and rect.top <= r.top + tol
-                   and rect.right >= r.right - tol and rect.bottom >= r.bottom - tol)
-        # 真全屏是「正好等于屏幕」，超出屏幕太多的一定是带边框的窗口
-        overflow = (max(0, r.left - rect.left) + max(0, rect.right - r.right)
-                    + max(0, r.top - rect.top) + max(0, rect.bottom - r.bottom))
-        return covered and overflow <= 4
+        mw = max(1, r.right - r.left)
+        mh = max(1, r.bottom - r.top)
+        w = max(0, rect.right - rect.left)
+        h = max(0, rect.bottom - rect.top)
+        cover = (w * h) / float(mw * mh)
+        detail = ("%s rect=%d,%d %dx%d mon=%dx%d cover=%.2f quns=%d"
+                  % (cls, rect.left, rect.top, w, h, mw, mh, cover, st))
+        if cover >= 0.95 and abs(rect.left - r.left) <= 12 and abs(rect.top - r.top) <= 12:
+            return True, "rect " + detail
+        return False, detail
 
     # ------------------------------------------------------------ 启动
     def run(self):
         self.root.mainloop()
 
 
+# 单实例：两个灵动岛叠在一起时，「全屏自动隐藏」只藏了其中一个，
+# 另一个照样悬在全屏画面上 —— 看起来就像「根本没修好」
+_SINGLETON_HANDLE = None
+
+
+def acquire_single_instance() -> bool:
+    """拿到进程级互斥体才算第一份；已有一份在跑就返回 False"""
+    global _SINGLETON_HANDLE
+    try:
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+        h = kernel32.CreateMutexW(None, True, "Local\\LingDongEGGY.SingleInstance")
+        if not h:
+            return True                      # 建不出来就照常跑，别把程序锁死
+        if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
+            return False
+        _SINGLETON_HANDLE = h
+        return True
+    except Exception:
+        return True
+
+
 def main():
+    if not acquire_single_instance():
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0, "灵动岛已经在运行了。\n\n如果是旧版本还挂在屏幕上，"
+                   "先在托盘/屏幕上右键旧的选「退出灵动岛」，再启动这个。",
+                APP_NAME, 0x40)
+        except Exception:
+            pass
+        return
     try:
         IslandApp().run()
     except Exception as exc:                     # GUI 程序没有控制台，弹窗告知
