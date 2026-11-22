@@ -42,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -231,7 +231,7 @@ COLUMNS = [
     ("gpu", "GPU", 84),
     ("disk", "磁盘", 62),
     ("bat", "电池", 82),
-    ("net", "网络", 96),
+    ("net", "网络", 112),
 ]
 STRIP_W = (PAD_L + sum(c[2] for c in COLUMNS) + COL_GAP * (len(COLUMNS) - 1)
            + COL_GAP + GEAR_W + PAD_R)
@@ -4014,9 +4014,9 @@ class IslandApp:
             tx = x + self.S(23)
             lab = c.create_text(tx, self.S(13), text=label, anchor="w",
                                 font=self.f_label, fill=ACC[key])
-            # 网络那列要放「↓速率 ↑速率」两个数，字号小一号才塞得下
+            # 网络那列放「↓速率 ↑速率」，用同一套数字字体（列宽已加宽到 112 容纳）
             val = c.create_text(tx, self.S(28), text="--", anchor="w",
-                                font=(self.f_menu if key == "net" else self.f_val),
+                                font=self.f_val,
                                 fill=txt_col)
             self._cols[key] = {"lab": lab, "val": val, "ring": ring}
             x += cw_px + self.S(COL_GAP)

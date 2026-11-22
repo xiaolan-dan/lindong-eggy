@@ -25,7 +25,7 @@ python dynamic_island.py
 
 （`启动灵动岛.bat` 会优先用 `pythonw.exe` 启动，所以不会弹出黑色命令行窗口。）
 
-**不想装 Python**：直接下 [Releases](https://github.com/xiaolan-dan/lindong-eggy/releases/latest) 里的 `LingDong-EGGY-v3.1.0.exe`，双击就能跑。单文件、免安装、约 14 MB，首次启动要解包，慢一两秒是正常的。
+**不想装 Python**：直接下 [Releases](https://github.com/xiaolan-dan/lindong-eggy/releases/latest) 里的 `LingDong-EGGY-v3.2.0.exe`，双击就能跑。单文件、免安装、约 14 MB，首次启动要解包，慢一两秒是正常的。
 
 打包自己改过的版本：
 
