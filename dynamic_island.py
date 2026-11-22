@@ -17,7 +17,7 @@ Python 3.9+ / Windows 10 及以上。
 
 交互：
     位置固定，不能拖动
-    右键        -> 设置菜单（主题、刷新频率、图片轮换、开机自启、全屏自动隐藏、
+    右键        -> 设置菜单（主题、刷新频率、图片轮换、开机自启、全屏/遮挡隐藏、
                    打开任务管理器、下一张图片、收起为图标、退出）
     右侧齿轮    -> 单击同样打开设置菜单（快捷入口）
 """
@@ -42,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.5"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -315,6 +315,23 @@ try:
     user32.GetParent.argtypes = [ctypes.c_void_p]
 except Exception:
     pass
+
+
+try:
+    user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, ctypes.c_void_p, ctypes.c_void_p),
+                                   ctypes.c_void_p]
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+    user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    wt.UINT]
+except Exception:
+    pass
+
+# 桌面 / 任务栏 / 开始菜单这类「不是应用窗口」的类名，算遮挡时全部跳过
+_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+                  "MultitaskingViewFrame", "Windows.UI.Core.CoreWindow", "DV2ControlHost",
+                  "XamlExplorerHostIslandWindow", "TopLevelWindowForOverflowXamlIsland",
+                  "NotifyIconOverflowWindow")
 
 
 def quns_state() -> int:
@@ -3529,7 +3546,7 @@ class SettingsPanel:
                       int(self.app._photo_interval), "photo_gap")
 
         self._switch_row(S(330), "开机自启动", self.app._autostart_enabled(), "auto")
-        self._switch_row(S(368), "全屏时自动隐藏", self.app._fs_hide, "fs")
+        self._switch_row(S(368), "全屏/遮挡时隐藏", self.app._fs_hide, "fs")
 
         # 动作按钮
         self._action(S(410), "收起为图标", "collapse")
@@ -3741,6 +3758,7 @@ class IslandApp:
         self._hidden_for_fullscreen = False
         self._fs_hide = False
         self._fs_streak = 0          # 全屏判断的连续计数，用来消抖
+        self._z_bottom = False       # 当前是不是被压到最底层
         self.refresh_interval = 1.0
         self._cpu_name, self._mhz = _cpu_info()
 
@@ -4614,7 +4632,7 @@ class IslandApp:
         m.add_checkbutton(label="开机自启动", variable=self._auto_var,
                           command=self._toggle_autostart)
         self._fs_var = tk.BooleanVar(value=self._fs_hide)
-        m.add_checkbutton(label="全屏时自动隐藏", variable=self._fs_var,
+        m.add_checkbutton(label="全屏/遮挡时隐藏", variable=self._fs_var,
                           command=self._set_fs_hide)
 
         self._photo_var = tk.BooleanVar(value=self._photo_on)
@@ -4740,17 +4758,21 @@ class IslandApp:
 
     def _fullscreen_tick(self):
         try:
-            fs, detail = self._fullscreen_probe()
+            fs, fdet = self._fullscreen_probe()
+            cov, cdet = self._covered_by_window()
+            # 「被盖住」= 真全屏，或者岛顶那块区域被别的窗口压着
+            covered = fs or cov
+            detail = fdet if fs else cdet
             prev = self._fs_streak
-            if fs:
+            if covered:
                 self._fs_streak = min(3, self._fs_streak + 1)
             else:
                 self._fs_streak = max(-3, self._fs_streak - 1)
             if self._fs_streak != prev:
                 self._fs_trace("streak=%+d %s%s" % (self._fs_streak, detail,
                                                    "" if self._fs_hide else " [switch off]"))
-            # 隐藏要连续两拍（约 3 秒）确认，免得切全屏那一下闪一下就藏；
-            # 退出全屏一拍就回来（约 1.5 秒）
+            # 隐藏要连续两拍（约 3 秒）确认，免得切窗口那一下闪一下就藏；
+            # 松开一拍就回来（约 1.5 秒）
             if self._fs_hide and self._fs_streak >= 2:
                 if not self._hidden_for_fullscreen:
                     self._hidden_for_fullscreen = True
@@ -4766,8 +4788,89 @@ class IslandApp:
             elif self._hidden_for_fullscreen and (self._fs_streak <= -1 or not self._fs_hide):
                 self._fs_trace("show " + detail)
                 self._show_island()
+            # 开关关着也不悬在别人窗口上面：被盖住就退到最底层，桌面露出来再回到最上层
+            if not self._hidden_for_fullscreen:
+                self._apply_z(True if self._fs_hide else (not covered))
         finally:
             self.root.after(1500, self._fullscreen_tick)
+
+    def _win_hwnd(self):
+        try:
+            h = self.root.winfo_id()
+            return user32.GetAncestor(h, 2) or h
+        except Exception:
+            return 0
+
+    def _apply_z(self, on_top):
+        """on_top=True 顶在最上层；False 直接压到所有窗口下面（HWND_BOTTOM）"""
+        if getattr(self, "_z_bottom", False) == (not on_top):
+            return
+        self._z_bottom = not on_top
+        try:
+            self.root.wm_attributes("-topmost", on_top)
+            hwnd = self._win_hwnd()
+            if on_top:
+                self.root.lift()
+                if hwnd:
+                    user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0,
+                                        0x0001 | 0x0002 | 0x0010)
+            elif hwnd:
+                user32.SetWindowPos(hwnd, ctypes.c_void_p(1), 0, 0, 0, 0,
+                                    0x0001 | 0x0002 | 0x0010)
+            self._fs_trace("z -> %s  %s" % ("top" if on_top else "bottom",
+                                            "屏幕顶部空着" if on_top else "被窗口盖住"))
+        except Exception:
+            pass
+
+    def _covered_by_window(self):
+        """岛顶那块面积现在被别的顶层窗口压着吗。
+        从 z 序最上面往下扫，第一个与岛窗口矩形相交 ≥6% 的（跳过桌面、任务栏、
+        开始菜单、cloaked UWP、最小化窗口和自己的窗口）就是压在上面那个。"""
+        rect = wt.RECT()
+        hwnd = self._win_hwnd()
+        if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False, "norect"
+        area = max(1, (rect.right - rect.left) * (rect.bottom - rect.top))
+        mine = os.getpid()
+        hit = []
+
+        def _cb(h, _lp):
+            try:
+                if not user32.IsWindowVisible(h) or user32.IsIconic(h):
+                    return True
+                pid = wt.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                if pid.value == mine:
+                    return True
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(h, buf, 256)
+                cls = buf.value
+                if cls in _SHELL_CLASSES:
+                    return True
+                if dwmapi is not None:
+                    cl = ctypes.c_int(0)
+                    dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(cl), ctypes.sizeof(cl))
+                    if cl.value:
+                        return True
+                r = wt.RECT()
+                if not user32.GetWindowRect(h, ctypes.byref(r)):
+                    return True
+                ix = min(rect.right, r.right) - max(rect.left, r.left)
+                iy = min(rect.bottom, r.bottom) - max(rect.top, r.top)
+                if ix > 0 and iy > 0 and ix * iy >= area * 0.06:
+                    hit.append("%s rect=%d,%d %dx%d" % (cls, r.left, r.top,
+                                                        r.right - r.left, r.bottom - r.top))
+                    return False          # 找到 z 序最上面那个就够
+            except Exception:
+                pass
+            return True
+
+        try:
+            user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, ctypes.c_void_p, ctypes.c_void_p)(_cb),
+                               None)
+        except Exception:
+            pass
+        return (True, "covered " + hit[0]) if hit else (False, "free")
 
     def _fs_trace(self, msg):
         """全屏隐藏的取证日志：%LOCALAPPDATA%\\LINDONG-EGGY\\fs.log，超过 400KB 自动截半。
@@ -4788,7 +4891,8 @@ class IslandApp:
         self._hidden_for_fullscreen = False
         try:
             self.root.deiconify()
-            self.root.wm_attributes("-topmost", True)
+            self._z_bottom = True          # 让下面的 _apply_z 真的把它顶回最上层
+            self._apply_z(True)
             self._apply_geometry()
         except Exception:
             pass
@@ -4822,7 +4926,7 @@ class IslandApp:
         buf = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(root_hwnd, buf, 256)
         cls = buf.value
-        if cls in ("Progman", "WorkerW", "Shell_TrayWnd", "MultitaskingViewFrame"):
+        if cls in _SHELL_CLASSES:
             return False, "shell:%s quns=%d" % (cls, st)
         # 最小化 / 不可见的窗口不算（切到桌面时前台窗口可能就是这种）
         if not user32.IsWindowVisible(root_hwnd) or user32.IsIconic(root_hwnd):
