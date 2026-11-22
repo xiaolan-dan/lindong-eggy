@@ -1087,10 +1087,20 @@ def make_morph_frame(master, w: int, h: int, base_w: int, base_h: int, base_rows
             body += key_bytes * o_lo
 
         def arc_px(x):
+            """圆头里的像素：够靠内就照抄照片，只有 2.6px 的边带才画描边
+
+            以前这里一律返回描边色、cov 还被夹到 1，等于把两侧圆头整块刷成
+            深色 —— 展开时圆头半径变大，看起来就是照片左右各缺一块。
+            """
             dxq = abs(x + 0.5 - cx) - half
             if dxq < 0.0:
                 dxq = 0.0
             sd = sq(dxq * dxq + dy * dy) - r
+            if sd <= -2.6:                        # 圆头内部：照片
+                o = xs3[x] if xs3 is not None else x * 3
+                return base_rows[rstart + o:rstart + o + 3]
+            if sd >= 1.2:
+                return key_bytes
             cov = 0.5 - sd
             if cov <= 0.0:
                 return key_bytes
