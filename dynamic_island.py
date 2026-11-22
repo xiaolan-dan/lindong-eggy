@@ -42,7 +42,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_NAME = "灵动岛 · 硬件状态"
-APP_VERSION = "3.4"
+APP_VERSION = "3.4.1"
 SCRIPT_PATH = os.path.abspath(__file__)
 
 # 打包成 exe（PyInstaller）后：__file__ 指向解包临时目录，sys.executable 才是 exe 本体。
@@ -4725,10 +4725,15 @@ class IslandApp:
     # ------------------------------------------------------------ 全屏自动隐藏
     def set_fs_hide(self, on):
         """开关全屏自动隐藏，顺便记住选择（下次启动还是这个状态）"""
-        self._fs_hide = bool(on)
+        on = bool(on)
+        if on != self._fs_hide:
+            self._fs_trace("switch -> %s" % ("on" if on else "off"))
+        self._fs_hide = on
         _cfg_patch({"fs_hide": self._fs_hide})
-        if not self._fs_hide and self._hidden_for_fullscreen:
-            self._show_island()
+        if not self._fs_hide:
+            self._fs_streak = 0
+            if self._hidden_for_fullscreen:
+                self._show_island()
 
     def _set_fs_hide(self):
         self.set_fs_hide(bool(self._fs_var.get()))
